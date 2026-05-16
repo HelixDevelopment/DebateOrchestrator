@@ -1,23 +1,25 @@
 // Package protocol hosts the wire-protocol surface for debate
 // orchestration: request/response message envelopes, transport
-// constructors, the HelixAgent client adapter, and the
-// in-process debate Protocol runner.
+// implementations (file-based and pipe-based IPC), the HelixAgent
+// client adapter, and the in-process debate Protocol runner.
 //
-// The current implementation is an honest stub at the transport/
-// execution layer — constructors return real-but-empty values so
-// callers can compose struct literals, but every transport and
-// debate-protocol method returns an explicit
-// `errors.New("debate/protocol: <Method> NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")`
-// error so callers cannot mistake a stub for a working endpoint.
-// Full implementation is tracked in RECONSTRUCTION_ROADMAP.md.
+// Transport, ExecuteRequest, HandleFederatedRequest, Standard.Initialize,
+// and HelixAgentClient.Connect are real, working implementations
+// (Phase 2 promotion from the previous honest-stub posture).
 package protocol
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +27,10 @@ import (
 
 	"digital.vasic.debate/topology"
 )
+
+// ProtocolVersion is the wire-protocol version advertised in
+// initialise handshakes.
+const ProtocolVersion = "1.0"
 
 // =============================================================================
 // Sentinel errors (debate-runner surface)
@@ -39,6 +45,28 @@ var ErrInvalidConfig = errors.New("debate/protocol: invalid config")
 // is called.
 var ErrNoAgentsConfigured = errors.New("debate/protocol: no agents configured")
 
+// ErrInvalidRequest is returned by ExecuteRequest /
+// HandleFederatedRequest when the supplied *Request fails baseline
+// validation (nil request, empty Method, …).
+var ErrInvalidRequest = errors.New("debate/protocol: invalid request")
+
+// ErrUnknownMethod is returned by ExecuteRequest when no handler is
+// registered for the request's Method.
+var ErrUnknownMethod = errors.New("debate/protocol: unknown method")
+
+// ErrUnsupportedFederatedMethod is returned by HandleFederatedRequest
+// when the request's Method is not in the federated method allow-list.
+var ErrUnsupportedFederatedMethod = errors.New(
+	"debate/protocol: unsupported federated method")
+
+// ErrNoEndpoint is returned by HelixAgentClient.Connect when the
+// client has no Endpoint configured to dial.
+var ErrNoEndpoint = errors.New("debate/protocol: no endpoint configured")
+
+// ErrTransportClosed is returned by Transport.Send / Transport.Recv
+// after the Transport has been Close()d.
+var ErrTransportClosed = errors.New("debate/protocol: transport closed")
+
 // =============================================================================
 // Wire-protocol surface (request/response/transport envelopes)
 // =============================================================================
@@ -49,10 +77,20 @@ type Standard struct {
 	Name string
 }
 
-// FileConfig configures a file-backed transport.
+// FileConfig configures a file-backed transport. The transport
+// reads inbound responses from InPath and writes outbound requests to
+// OutPath using newline-delimited JSON framing. If only Path is set
+// (legacy single-file callers), the transport opens that path for
+// both read and write — useful for offline replay against a captured
+// session log.
 type FileConfig struct {
-	// Path is the on-disk path the transport will use.
+	// Path is the legacy single-on-disk path the transport uses for
+	// both directions. Used when InPath and OutPath are empty.
 	Path string
+	// InPath is the on-disk path responses are read from.
+	InPath string
+	// OutPath is the on-disk path requests are written to.
+	OutPath string
 }
 
 // Message is a single chat-style message exchanged with an agent.
@@ -157,8 +195,26 @@ type InitializeResult struct {
 	ServerInfo string
 }
 
-// HelixAgentClient is the adapter for talking to a HelixAgent peer.
-type HelixAgentClient struct{}
+// HelixAgentClient is the adapter for talking to a HelixAgent peer
+// over TCP. Endpoint is dialled by Connect; the resulting net.Conn is
+// retained on the struct so subsequent reads/writes can flow through
+// the same connection.
+type HelixAgentClient struct {
+	// Endpoint is the TCP address (host:port) the client dials.
+	Endpoint string
+	// DialTimeout caps the dial duration. Zero defers to ctx.
+	DialTimeout time.Duration
+
+	mu     sync.Mutex
+	conn   net.Conn
+	closed bool
+}
+
+// NewHelixAgentClient constructs a HelixAgentClient bound to the
+// supplied TCP endpoint.
+func NewHelixAgentClient(endpoint string) *HelixAgentClient {
+	return &HelixAgentClient{Endpoint: endpoint}
+}
 
 // =============================================================================
 // Debate-protocol surface (Config, Protocol runner, AgentInvoker, results)
@@ -322,6 +378,13 @@ func (f AgentInvokerFunc) Invoke(ctx context.Context, agent *topology.Agent,
 	return f(ctx, agent, prompt, debateCtx)
 }
 
+// RequestHandler handles a single wire-protocol request dispatched
+// through Protocol.ExecuteRequest. Handlers receive the unwrapped
+// parameter bag and return an arbitrary Result payload (placed
+// verbatim into the *Response.Result field).
+type RequestHandler func(ctx context.Context,
+	params map[string]interface{}) (interface{}, error)
+
 // Protocol is the in-process debate Protocol runner.
 type Protocol struct {
 	// Name identifies the protocol instance.
@@ -335,11 +398,45 @@ type Protocol struct {
 	// callers exclusively use RegisterAgent.
 	Invoker AgentInvoker
 
-	// mu guards agents.
+	// mu guards agents + handlers.
 	mu sync.RWMutex
 	// agents maps agent ID -> AgentInvoker. Populated via
 	// RegisterAgent; consulted by Execute to dispatch per-agent calls.
 	agents map[string]AgentInvoker
+	// handlers maps method-name -> RequestHandler. Populated via
+	// RegisterHandler; consulted by ExecuteRequest /
+	// HandleFederatedRequest to route inbound wire-protocol requests.
+	handlers map[string]RequestHandler
+}
+
+// RegisterHandler registers a RequestHandler under the supplied
+// method name. Subsequent calls with the same name replace the prior
+// handler. Empty names and nil handlers are rejected with
+// ErrInvalidRequest.
+func (p *Protocol) RegisterHandler(method string, h RequestHandler) error {
+	if method == "" {
+		return fmt.Errorf("%w: RegisterHandler empty method", ErrInvalidRequest)
+	}
+	if h == nil {
+		return fmt.Errorf("%w: RegisterHandler nil handler for %q",
+			ErrInvalidRequest, method)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.handlers == nil {
+		p.handlers = make(map[string]RequestHandler)
+	}
+	p.handlers[method] = h
+	return nil
+}
+
+// handler returns the registered RequestHandler for the supplied
+// method, or (nil, false) if no handler is registered.
+func (p *Protocol) handler(method string) (RequestHandler, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	h, ok := p.handlers[method]
+	return h, ok
 }
 
 // RegisterAgent registers an AgentInvoker under the supplied agent
@@ -386,9 +483,10 @@ func (p *Protocol) Agents() []string {
 // stub forward-compatible.
 func NewProtocol(cfg Config, opts ...interface{}) *Protocol {
 	p := &Protocol{
-		Name:   cfg.Name,
-		Config: cfg,
-		agents: make(map[string]AgentInvoker),
+		Name:     cfg.Name,
+		Config:   cfg,
+		agents:   make(map[string]AgentInvoker),
+		handlers: make(map[string]RequestHandler),
 	}
 	if len(opts) >= 1 {
 		if topo, ok := opts[0].(topology.Topology); ok {
@@ -719,24 +817,81 @@ func copyMetadata(src map[string]interface{}) map[string]interface{} {
 }
 
 // ExecuteRequest dispatches a wire-protocol request through the
-// Protocol envelope (legacy transport surface).
+// Protocol envelope. The request's Method is looked up in the
+// registered RequestHandler map; the handler is invoked with the
+// supplied ctx + req.Params; the result (or error) is wrapped in a
+// *Response and returned.
+//
+// Returns ErrInvalidRequest when req is nil or has an empty Method;
+// ErrUnknownMethod when no handler is registered for the method;
+// ctx.Err() when the supplied context is cancelled before dispatch.
 func (p *Protocol) ExecuteRequest(ctx context.Context, req *Request) (*Response, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	_ = req
-	return nil, errors.New("debate/protocol: ExecuteRequest NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	if req == nil {
+		return nil, fmt.Errorf("%w: nil request", ErrInvalidRequest)
+	}
+	if strings.TrimSpace(req.Method) == "" {
+		return nil, fmt.Errorf("%w: empty Method", ErrInvalidRequest)
+	}
+	h, ok := p.handler(req.Method)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownMethod, req.Method)
+	}
+	result, err := h(ctx, req.Params)
+	if err != nil {
+		// Surface the handler error both as wire-error and a Go-level
+		// error so callers can switch on whichever they need.
+		return &Response{ID: req.ID, Error: err}, err
+	}
+	return &Response{ID: req.ID, Result: result}, nil
 }
 
-// HandleFederatedRequest dispatches a federated protocol request.
+// federatedAllowedMethods is the closed allow-list of method names
+// HandleFederatedRequest will accept. Anything else returns
+// ErrUnsupportedFederatedMethod. Keeping it narrow is a security
+// posture choice: federated calls execute on a remote node, so the
+// surface area exposed to peers stays explicit.
+var federatedAllowedMethods = map[string]struct{}{
+	"federated.participate": {},
+}
+
+// HandleFederatedRequest dispatches a federated protocol request
+// arriving from a peer DebateOrchestrator node. The request's Method
+// MUST be in the federated allow-list (currently:
+// "federated.participate"); otherwise ErrUnsupportedFederatedMethod
+// is returned without touching the handler map.
+//
+// On allowed methods the request is routed through the same handler
+// map as ExecuteRequest — register a RequestHandler for
+// "federated.participate" to wire in the per-node participation
+// logic. The handler error (if any) is surfaced both in the returned
+// *Response.Error and as the Go-level error.
 func (p *Protocol) HandleFederatedRequest(ctx context.Context, req *Request) (*Response, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	_ = req
-	return nil, errors.New("debate/protocol: HandleFederatedRequest NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	if req == nil {
+		return nil, fmt.Errorf("%w: nil request", ErrInvalidRequest)
+	}
+	if strings.TrimSpace(req.Method) == "" {
+		return nil, fmt.Errorf("%w: empty Method", ErrInvalidRequest)
+	}
+	if _, allowed := federatedAllowedMethods[req.Method]; !allowed {
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedFederatedMethod, req.Method)
+	}
+	// Route through the regular handler map.
+	h, ok := p.handler(req.Method)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q (federated allow-listed but no handler registered)",
+			ErrUnknownMethod, req.Method)
+	}
+	result, err := h(ctx, req.Params)
+	if err != nil {
+		return &Response{ID: req.ID, Error: err}, err
+	}
+	return &Response{ID: req.ID, Result: result}, nil
 }
 
 // =============================================================================
@@ -748,17 +903,291 @@ func NewStandard() *Standard {
 	return &Standard{Name: "standard"}
 }
 
-// NewFileTransport constructs a file-backed transport.
-func NewFileTransport(cfg FileConfig) (interface{}, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
-	_ = cfg
-	return nil, errors.New("debate/protocol: NewFileTransport NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+// Transport is the common interface implemented by every wire
+// transport (file-backed, pipe-backed, future TCP/etc.). All transports
+// frame messages as newline-delimited JSON: Send appends one
+// JSON-encoded *Request + "\n" to the outbound stream; Recv reads one
+// JSON-encoded *Response from the inbound stream.
+type Transport interface {
+	// Send writes the supplied request to the outbound stream. Returns
+	// ErrTransportClosed after Close; honours ctx via the underlying
+	// io.Writer or polling loop.
+	Send(ctx context.Context, req *Request) error
+	// Recv reads the next response from the inbound stream. Blocks
+	// until data is available, the inbound stream is closed (returns
+	// io.EOF), the ctx is cancelled (returns ctx.Err()), or the
+	// transport is closed (returns ErrTransportClosed).
+	Recv(ctx context.Context) (*Response, error)
+	// Close releases the underlying file/pipe handles. Idempotent.
+	Close() error
 }
 
-// NewPipeTransport constructs a pipe-backed transport.
-func NewPipeTransport() (interface{}, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
-	return nil, errors.New("debate/protocol: NewPipeTransport NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+// FileTransport is a real file-backed Transport. Inbound responses
+// are read from inPath using newline-delimited JSON framing; outbound
+// requests are appended to outPath using the same framing. When the
+// caller-supplied FileConfig.Path is set (legacy single-file mode)
+// both directions use the same file — useful for offline replay.
+type FileTransport struct {
+	inPath  string
+	outPath string
+
+	mu         sync.Mutex
+	closed     bool
+	outFile    *os.File
+	inFile     *os.File
+	inReader   *bufio.Reader
+	pollPeriod time.Duration
+}
+
+// NewFileTransport constructs a real file-backed Transport bound to
+// the supplied FileConfig. If InPath / OutPath are set independently
+// the transport reads from InPath and writes to OutPath. If only
+// Path is set both directions resolve to that file (offline-replay
+// mode). The outbound file is opened with O_CREATE|O_APPEND|O_WRONLY
+// so multiple senders never truncate prior framed messages.
+func NewFileTransport(cfg FileConfig) (Transport, error) {
+	in := cfg.InPath
+	out := cfg.OutPath
+	if in == "" {
+		in = cfg.Path
+	}
+	if out == "" {
+		out = cfg.Path
+	}
+	if in == "" || out == "" {
+		return nil, fmt.Errorf(
+			"%w: FileConfig requires InPath+OutPath or Path",
+			ErrInvalidRequest)
+	}
+	// Open outbound file for append + create.
+	outFile, err := os.OpenFile(out,
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"debate/protocol: open outbound %q: %w", out, err)
+	}
+	// Open inbound file. Create if missing so Recv has a target to
+	// poll while the other side is producing.
+	inFile, err := os.OpenFile(in,
+		os.O_CREATE|os.O_RDONLY, 0o600)
+	if err != nil {
+		_ = outFile.Close()
+		return nil, fmt.Errorf(
+			"debate/protocol: open inbound %q: %w", in, err)
+	}
+	return &FileTransport{
+		inPath:     in,
+		outPath:    out,
+		outFile:    outFile,
+		inFile:     inFile,
+		inReader:   bufio.NewReader(inFile),
+		pollPeriod: 5 * time.Millisecond,
+	}, nil
+}
+
+// Send appends the JSON-encoded request + "\n" to the outbound file.
+// Returns ErrTransportClosed after Close; ctx.Err() if the supplied
+// context is already cancelled.
+func (t *FileTransport) Send(ctx context.Context, req *Request) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return ErrTransportClosed
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("debate/protocol: marshal request: %w", err)
+	}
+	payload = append(payload, '\n')
+	if _, err := t.outFile.Write(payload); err != nil {
+		return fmt.Errorf(
+			"debate/protocol: write to %q: %w", t.outPath, err)
+	}
+	return nil
+}
+
+// Recv reads the next JSON-encoded response from the inbound file.
+// Blocks (polling at pollPeriod) until a complete framed message is
+// available, the ctx is cancelled, or the transport is closed.
+func (t *FileTransport) Recv(ctx context.Context) (*Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for {
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return nil, ErrTransportClosed
+		}
+		reader := t.inReader
+		t.mu.Unlock()
+
+		line, err := reader.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf(
+				"debate/protocol: read from %q: %w", t.inPath, err)
+		}
+		line = bytes.TrimRight(line, "\n")
+		if len(line) > 0 {
+			var resp Response
+			if jerr := json.Unmarshal(line, &resp); jerr != nil {
+				return nil, fmt.Errorf(
+					"debate/protocol: unmarshal response: %w", jerr)
+			}
+			return &resp, nil
+		}
+		// No data yet — poll, but honour ctx.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(t.pollPeriod):
+			// loop and retry
+		}
+	}
+}
+
+// Close releases the file handles. Idempotent.
+func (t *FileTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	t.closed = true
+	var firstErr error
+	if t.outFile != nil {
+		if err := t.outFile.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if t.inFile != nil {
+		if err := t.inFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// PipeTransport is a real os.Pipe-backed Transport — useful for
+// in-process IPC and unit testing of the framing layer.
+type PipeTransport struct {
+	reader *os.File
+	writer *os.File
+
+	mu       sync.Mutex
+	closed   bool
+	inReader *bufio.Reader
+}
+
+// NewPipeTransport constructs a real Transport backed by an os.Pipe.
+// Send writes to the pipe's write end; Recv reads from the read end.
+// Both ends live on the same struct so Send + Recv against the same
+// PipeTransport instance form a loopback suitable for tests.
+func NewPipeTransport() (Transport, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("debate/protocol: os.Pipe: %w", err)
+	}
+	return &PipeTransport{
+		reader:   r,
+		writer:   w,
+		inReader: bufio.NewReader(r),
+	}, nil
+}
+
+// Send writes the JSON-encoded request + "\n" to the pipe.
+func (t *PipeTransport) Send(ctx context.Context, req *Request) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return ErrTransportClosed
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("debate/protocol: marshal request: %w", err)
+	}
+	payload = append(payload, '\n')
+	if _, err := t.writer.Write(payload); err != nil {
+		return fmt.Errorf("debate/protocol: write pipe: %w", err)
+	}
+	return nil
+}
+
+// Recv reads the next JSON-encoded response from the pipe. The read
+// runs on a goroutine so ctx cancellation is observed even when the
+// underlying pipe blocks; on ctx cancellation the goroutine is left
+// to drain naturally when data arrives or the pipe is closed.
+func (t *PipeTransport) Recv(ctx context.Context) (*Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, ErrTransportClosed
+	}
+	reader := t.inReader
+	t.mu.Unlock()
+
+	type readResult struct {
+		line []byte
+		err  error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		line, err := reader.ReadBytes('\n')
+		done <- readResult{line: line, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-done:
+		if r.err != nil && r.err != io.EOF {
+			return nil, fmt.Errorf("debate/protocol: read pipe: %w", r.err)
+		}
+		line := bytes.TrimRight(r.line, "\n")
+		if len(line) == 0 {
+			if r.err == io.EOF {
+				return nil, io.EOF
+			}
+			return nil, fmt.Errorf("debate/protocol: empty frame")
+		}
+		var resp Response
+		if jerr := json.Unmarshal(line, &resp); jerr != nil {
+			return nil, fmt.Errorf(
+				"debate/protocol: unmarshal response: %w", jerr)
+		}
+		return &resp, nil
+	}
+}
+
+// Close releases the pipe ends. Idempotent.
+func (t *PipeTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	t.closed = true
+	var firstErr error
+	if t.writer != nil {
+		if err := t.writer.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if t.reader != nil {
+		if err := t.reader.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // DefaultDebateConfig returns the canonical default debate config.
@@ -807,20 +1236,105 @@ func GetCapabilities() []string {
 	return []string{}
 }
 
-// Initialize performs the protocol initialise handshake.
+// Initialize performs the protocol initialise self-handshake. The
+// Standard struct represents this node's protocol identity; the
+// returned InitializeResult advertises the negotiated protocol
+// version and the server identification string (package version +
+// Standard.Name when set).
 func (s *Standard) Initialize(ctx context.Context) (*InitializeResult, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return nil, errors.New("debate/protocol: Initialize NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	name := "DebateOrchestrator"
+	if s != nil && s.Name != "" {
+		name = "DebateOrchestrator/" + s.Name
+	}
+	return &InitializeResult{
+		ProtocolVersion: ProtocolVersion,
+		ServerInfo:      name + " v" + ProtocolVersion,
+	}, nil
 }
 
-// Connect establishes a connection to the HelixAgent peer.
+// Connect performs a real TCP dial to the configured Endpoint. The
+// resulting net.Conn is retained on the client for subsequent
+// reads/writes. Returns ErrNoEndpoint when Endpoint is empty; wraps
+// dial errors with the endpoint string for diagnostics.
+//
+// The ctx deadline (if any) bounds the dial. If c.DialTimeout is set
+// it caps the dial duration; otherwise the dial honours only the
+// ctx deadline.
 func (c *HelixAgentClient) Connect(ctx context.Context) error {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.New("debate/protocol: Connect NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	if c == nil {
+		return fmt.Errorf("%w: nil receiver", ErrNoEndpoint)
+	}
+	if strings.TrimSpace(c.Endpoint) == "" {
+		return ErrNoEndpoint
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrTransportClosed
+	}
+	// If already connected, return without redialing.
+	if c.conn != nil {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	var dialer net.Dialer
+	if c.DialTimeout > 0 {
+		dialer.Timeout = c.DialTimeout
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", c.Endpoint)
+	if err != nil {
+		return fmt.Errorf(
+			"debate/protocol: dial %q: %w", c.Endpoint, err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Race-defence: if Close ran between unlock and lock, abandon
+	// the freshly-dialled conn.
+	if c.closed {
+		_ = conn.Close()
+		return ErrTransportClosed
+	}
+	c.conn = conn
+	return nil
+}
+
+// Close shuts down the active connection (if any) and marks the
+// client as closed so subsequent Connect attempts fail fast.
+// Idempotent.
+func (c *HelixAgentClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	if c.conn != nil {
+		err := c.conn.Close()
+		c.conn = nil
+		return err
+	}
+	return nil
+}
+
+// Conn returns the underlying net.Conn for callers that need to
+// write/read raw bytes. Returns nil before Connect succeeds or after
+// Close.
+func (c *HelixAgentClient) Conn() net.Conn {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn
 }
