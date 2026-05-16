@@ -39,7 +39,7 @@ CONST-035 / Article XI §11.9.
    thin adapter.
 4. **Challenges.** Every package's `_test.go` covers structural
    guarantees and stub-honesty today. Phase 2 adds Challenge scripts
-   under `Challenges/banks/debate_orchestrator/` that exercise
+   under `challenges/banks/debate_orchestrator/` that exercise
    end-to-end flows against real infrastructure.
 5. **Documentation.** Update `README.md` tier table after each STUB →
    REAL transition; never claim a package is REAL without a passing
