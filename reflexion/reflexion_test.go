@@ -2,12 +2,16 @@ package reflexion
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestReflexionStubsReturnNotYetImplemented(t *testing.T) {
+func TestReflexionLegacyAPIs_AreRealWrappers(t *testing.T) {
 	ctx := context.Background()
 	cfg := DefaultReflexionConfig()
 
@@ -15,23 +19,124 @@ func TestReflexionStubsReturnNotYetImplemented(t *testing.T) {
 	if b.Capacity != cfg.MaxMemoryEntries {
 		t.Fatalf("Capacity = %d, want %d", b.Capacity, cfg.MaxMemoryEntries)
 	}
-	if err := b.Append(ctx, nil); err == nil || !strings.Contains(err.Error(), "NotYetImplemented") {
-		t.Fatalf("EpisodicMemoryBuffer.Append: %v", err)
+
+	// Append with non-*Episode payload → typed error sentinel.
+	if err := b.Append(ctx, "not-an-episode"); !errors.Is(err, ErrInvalidEpisode) {
+		t.Fatalf("Append(string): expected ErrInvalidEpisode, got %v", err)
 	}
+	if err := b.Append(ctx, nil); !errors.Is(err, ErrInvalidEpisode) {
+		t.Fatalf("Append(nil): expected ErrInvalidEpisode, got %v", err)
+	}
+
+	// Append with valid *Episode → REAL Store path.
+	if err := b.Append(ctx, &Episode{AgentID: "legacy-caller", TaskDescription: "t1"}); err != nil {
+		t.Fatalf("Append(*Episode): unexpected error %v", err)
+	}
+	if got := b.Size(); got != 1 {
+		t.Fatalf("Size after Append: got %d, want 1", got)
+	}
+
 	g := NewReflectionGenerator(nil)
-	// Generate with nil input now reports a typed-error sentinel that
-	// still carries the actionable RECONSTRUCTION_ROADMAP.md pointer.
+	// Generate with nil input still reports a typed-error sentinel that
+	// carries the actionable RECONSTRUCTION_ROADMAP.md pointer.
 	if _, err := g.Generate(ctx, nil); err == nil ||
 		!strings.Contains(err.Error(), "RECONSTRUCTION_ROADMAP.md") {
 		t.Fatalf("ReflectionGenerator.Generate(nil): expected RECONSTRUCTION_ROADMAP.md pointer, got %v", err)
 	}
+
 	l := NewReflexionLoop(cfg, g, nil, b)
-	if _, err := l.Run(ctx, nil); err == nil || !strings.Contains(err.Error(), "NotYetImplemented") {
-		t.Fatalf("ReflexionLoop.Run: %v", err)
+	// Run with non-*ReflexionTask → typed error sentinel.
+	if _, err := l.Run(ctx, "not-a-task"); !errors.Is(err, ErrInvalidReflexionTask) {
+		t.Fatalf("Run(string): expected ErrInvalidReflexionTask, got %v", err)
 	}
+	if _, err := l.Run(ctx, nil); !errors.Is(err, ErrInvalidReflexionTask) {
+		t.Fatalf("Run(nil): expected ErrInvalidReflexionTask, got %v", err)
+	}
+
+	// Persist without path → typed error sentinel.
 	a := NewAccumulatedWisdom()
-	if err := a.Persist(ctx); err == nil || !strings.Contains(err.Error(), "NotYetImplemented") {
-		t.Fatalf("AccumulatedWisdom.Persist: %v", err)
+	if err := a.Persist(ctx); !errors.Is(err, ErrNoPersistencePath) {
+		t.Fatalf("Persist without path: expected ErrNoPersistencePath, got %v", err)
+	}
+}
+
+func TestReflexionLoop_RunWrapsExecute(t *testing.T) {
+	ctx := context.Background()
+	cfg := DefaultReflexionConfig()
+	cfg.MaxAttempts = 1
+	b := NewEpisodicMemoryBuffer(cfg.MaxMemoryEntries)
+	g := NewReflectionGenerator(nil)
+	exec := &stubExecutor{passes: true}
+	l := NewReflexionLoop(cfg, g, exec, b)
+
+	task := &ReflexionTask{
+		Description: "wrap-test",
+		AgentID:     "agent-1",
+		SessionID:   "sess-1",
+		Language:    "go",
+		CodeGenerator: func(ctx context.Context, desc string, prior []*Reflection) (string, error) {
+			return "package main", nil
+		},
+	}
+	out, err := l.Run(ctx, task)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	res, ok := out.(*ReflexionResult)
+	if !ok || res == nil {
+		t.Fatalf("Run return: expected *ReflexionResult, got %T", out)
+	}
+	if !res.AllPassed {
+		t.Fatalf("AllPassed = false, want true (stubExecutor returns pass)")
+	}
+	if res.Attempts != 1 {
+		t.Fatalf("Attempts = %d, want 1", res.Attempts)
+	}
+}
+
+type stubExecutor struct{ passes bool }
+
+func (s *stubExecutor) Execute(ctx context.Context, code, lang string) ([]*TestResult, error) {
+	return []*TestResult{{Name: "t1", Passed: s.passes}}, nil
+}
+
+func TestAccumulatedWisdom_PersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wisdom.json")
+	a := NewAccumulatedWisdom(WithPersistencePath(path))
+	w := &Wisdom{Pattern: "nil deref", Frequency: 4, Domain: "code", Tags: []string{"runtime"}}
+	if err := a.Store(w); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if err := a.Persist(context.Background()); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var decoded []*Wisdom
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("decoded len = %d, want 1", len(decoded))
+	}
+	if decoded[0].Pattern != "nil deref" {
+		t.Fatalf("decoded pattern = %q, want %q", decoded[0].Pattern, "nil deref")
+	}
+	if decoded[0].ID == "" {
+		t.Fatalf("decoded ID empty — Store should have generated one")
+	}
+}
+
+func TestAccumulatedWisdom_PersistCancelledCtx(t *testing.T) {
+	dir := t.TempDir()
+	a := NewAccumulatedWisdom(WithPersistencePath(filepath.Join(dir, "x.json")))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.Persist(ctx); err == nil {
+		t.Fatal("Persist on cancelled ctx: expected error, got nil")
 	}
 }
 

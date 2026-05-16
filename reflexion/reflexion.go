@@ -9,17 +9,25 @@
 // run a deterministic fallback path so callers can stage code today
 // — fallbacks carry the
 // `// TODO(reconstruction-phase-2): real implementation pending`
-// marker. The original NotYetImplemented stubs (.Append, .Run,
-// .Persist) are preserved under their original names for
-// backwards compatibility.
+// marker.
+//
+// Legacy compatibility entry-points (.Append, .Run, .Persist) are
+// now REAL thin wrappers around the modern API:
+//   - EpisodicMemoryBuffer.Append wraps Store with type assertion.
+//   - ReflexionLoop.Run wraps Execute with type assertion.
+//   - AccumulatedWisdom.Persist writes the wisdom store to disk as
+//     newline-delimited JSON via WithPersistencePath, or returns
+//     ErrNoPersistencePath when no path was configured.
 package reflexion
 
 import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -241,16 +249,30 @@ func (b *EpisodicMemoryBuffer) Store(ep *Episode) error {
 	return nil
 }
 
-// Append records an episodic memory entry (legacy stub preserved for
-// backwards compatibility — returns NotYetImplemented).
+// Append records an episodic memory entry. This is the legacy
+// API surface: it accepts an interface{} for backwards compatibility
+// with callers that pass an untyped payload. The argument MUST be a
+// non-nil *Episode; any other type returns ErrInvalidEpisode.
+//
+// Append is a real thin wrapper over Store — same FIFO eviction,
+// same thread-safety, same Capacity contract.
 func (b *EpisodicMemoryBuffer) Append(ctx context.Context, entry interface{}) error {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = entry
-	return errors.New("debate/reflexion: EpisodicMemoryBuffer.Append NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	if entry == nil {
+		return ErrInvalidEpisode
+	}
+	ep, ok := entry.(*Episode)
+	if !ok || ep == nil {
+		return ErrInvalidEpisode
+	}
+	return b.Store(ep)
 }
+
+// ErrInvalidEpisode is returned when EpisodicMemoryBuffer.Append is
+// invoked with anything other than a non-nil *Episode.
+var ErrInvalidEpisode = errors.New("debate/reflexion: EpisodicMemoryBuffer.Append requires a non-nil *Episode")
 
 // Size returns the number of episodes currently held.
 func (b *EpisodicMemoryBuffer) Size() int {
@@ -485,16 +507,30 @@ func NewReflexionLoop(
 }
 
 // Run executes the reflexion loop end-to-end against a free-form
-// input (legacy stub preserved for backwards compatibility — returns
-// NotYetImplemented).
+// input. This is the legacy API surface: it accepts an interface{}
+// for backwards compatibility. The argument MUST be a non-nil
+// *ReflexionTask; any other type returns ErrInvalidReflexionTask.
+//
+// Run is a real thin wrapper over Execute — same maxAttempts logic,
+// same early-exit semantics, same return data. The interface{}
+// return is the *ReflexionResult Execute produces.
 func (l *ReflexionLoop) Run(ctx context.Context, input interface{}) (interface{}, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	_ = input
-	return nil, errors.New("debate/reflexion: ReflexionLoop.Run NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	if input == nil {
+		return nil, ErrInvalidReflexionTask
+	}
+	task, ok := input.(*ReflexionTask)
+	if !ok || task == nil {
+		return nil, ErrInvalidReflexionTask
+	}
+	return l.Execute(ctx, task)
 }
+
+// ErrInvalidReflexionTask is returned when ReflexionLoop.Run is
+// invoked with anything other than a non-nil *ReflexionTask.
+var ErrInvalidReflexionTask = errors.New("debate/reflexion: ReflexionLoop.Run requires a non-nil *ReflexionTask")
 
 // Execute drives the reflexion loop for the supplied task.
 //
@@ -606,25 +642,73 @@ func (l *ReflexionLoop) Execute(ctx context.Context, task *ReflexionTask) (*Refl
 
 // AccumulatedWisdom is the long-running cross-debate knowledge store.
 type AccumulatedWisdom struct {
-	mu      sync.RWMutex
-	store   []*Wisdom
-	byID    map[string]*Wisdom
-	seedKey int
+	mu              sync.RWMutex
+	store           []*Wisdom
+	byID            map[string]*Wisdom
+	seedKey         int
+	persistencePath string
 }
 
-// NewAccumulatedWisdom constructs an empty AccumulatedWisdom.
-func NewAccumulatedWisdom() *AccumulatedWisdom {
-	return &AccumulatedWisdom{byID: make(map[string]*Wisdom)}
+// WisdomOption configures an AccumulatedWisdom at construction time.
+type WisdomOption func(*AccumulatedWisdom)
+
+// WithPersistencePath directs Persist to write the wisdom store to
+// the supplied file path as a single JSON document. The file is
+// truncated + rewritten on every Persist call (atomic via tempfile +
+// rename to avoid partial writes).
+func WithPersistencePath(path string) WisdomOption {
+	return func(a *AccumulatedWisdom) {
+		a.persistencePath = path
+	}
 }
 
-// Persist writes the wisdom store to durable storage (legacy stub
-// preserved for backwards compatibility — returns NotYetImplemented).
+// NewAccumulatedWisdom constructs an empty AccumulatedWisdom with
+// the supplied options.
+func NewAccumulatedWisdom(opts ...WisdomOption) *AccumulatedWisdom {
+	a := &AccumulatedWisdom{byID: make(map[string]*Wisdom)}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(a)
+		}
+	}
+	return a
+}
+
+// ErrNoPersistencePath is returned by Persist when the wisdom store
+// was constructed without WithPersistencePath.
+var ErrNoPersistencePath = errors.New("debate/reflexion: AccumulatedWisdom has no persistence path — supply WithPersistencePath at construction")
+
+// Persist writes the wisdom store to the configured persistence path
+// as a single JSON document. Atomic via tempfile + rename. Returns
+// ErrNoPersistencePath when no path was configured; returns ctx.Err()
+// when the context is cancelled; surfaces marshalling / I/O errors
+// otherwise.
 func (a *AccumulatedWisdom) Persist(ctx context.Context) error {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.New("debate/reflexion: AccumulatedWisdom.Persist NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	a.mu.RLock()
+	path := a.persistencePath
+	if path == "" {
+		a.mu.RUnlock()
+		return ErrNoPersistencePath
+	}
+	snapshot := make([]*Wisdom, len(a.store))
+	copy(snapshot, a.store)
+	a.mu.RUnlock()
+
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("debate/reflexion: AccumulatedWisdom.Persist marshal: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("debate/reflexion: AccumulatedWisdom.Persist write tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("debate/reflexion: AccumulatedWisdom.Persist rename: %w", err)
+	}
+	return nil
 }
 
 // Store appends a Wisdom record to the store. If the record carries
