@@ -1,8 +1,12 @@
 // Package comprehensive bundles the orchestrator together with the
 // supporting role/agent/invoker machinery used by HelixAgent. The core
-// ExecuteDebate flow is REAL; StreamDebate is an honest NotImplemented
-// stub that returns an explicit error so callers cannot silently fall
-// through to fake data.
+// ExecuteDebate flow is REAL; StreamDebate is REAL streaming-runtime
+// using post-hoc replay: ExecuteDebate runs end-to-end, then the
+// orchestrator response is walked to emit ordered StreamEvent values
+// (started → per-phase phase_started/agent_response/phase_completed →
+// completed) carrying the real phase, agent, and content data through
+// the supplied StreamHandler. See StreamDebate's doc-comment for the
+// full event contract and cancellation semantics.
 package comprehensive
 
 import (

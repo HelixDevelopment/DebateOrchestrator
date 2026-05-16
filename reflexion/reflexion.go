@@ -134,21 +134,31 @@ type Episode struct {
 // Wisdom is a cross-episode pattern extracted by AccumulatedWisdom.
 type Wisdom struct {
 	// ID is the wisdom record identifier.
-	ID string
+	ID string `json:"id,omitempty"`
 	// Pattern is the wisdom pattern (free-form text).
-	Pattern string
+	Pattern string `json:"pattern,omitempty"`
+	// Description is the free-form human-readable description of the
+	// wisdom record.
+	Description string `json:"description,omitempty"`
 	// Frequency is the number of episodes the pattern was derived from.
-	Frequency int
+	Frequency int `json:"frequency,omitempty"`
+	// Confidence is the wisdom's self-reported confidence (capped at 1.0).
+	Confidence float64 `json:"confidence,omitempty"`
+	// Source identifies the wisdom's provenance (e.g. "extracted",
+	// "manual", "imported").
+	Source string `json:"source,omitempty"`
 	// Domain is the wisdom domain (e.g. "code", "review").
-	Domain string
+	Domain string `json:"domain,omitempty"`
 	// Tags is the wisdom tag list.
-	Tags []string
+	Tags []string `json:"tags,omitempty"`
 	// UseCount is the number of times the wisdom has been applied.
-	UseCount int
+	UseCount int `json:"use_count,omitempty"`
 	// SuccessRate is the ratio of successful applications.
-	SuccessRate float64
+	SuccessRate float64 `json:"success_rate,omitempty"`
 	// Impact is the wisdom's impact score.
-	Impact float64
+	Impact float64 `json:"impact,omitempty"`
+	// Timestamp is the wisdom creation/extraction timestamp.
+	Timestamp time.Time `json:"timestamp,omitempty"`
 
 	// successHits / failureHits keep the running counts used by
 	// RecordUsage. Exposed via SuccessRate.
@@ -323,48 +333,158 @@ func (b *EpisodicMemoryBuffer) GetRecent(n int) []*Episode {
 	return out
 }
 
-// GetRelevant returns up to `n` episodes whose TaskDescription,
-// FailureAnalysis, or Reflection root cause contains `query`
-// (case-insensitive substring match).
+// GetRelevant returns up to `limit` episodes ranked by token-overlap
+// (Jaccard) similarity between the query and each episode's text
+// content (TaskDescription + FailureAnalysis + Reflection root cause +
+// what-went-wrong + what-to-change-next).
 //
-// Honest-stub relevance: this is a deterministic substring-based
-// shortlist, not a real embedding search. Real relevance is tracked
-// in RECONSTRUCTION_ROADMAP.md.
-func (b *EpisodicMemoryBuffer) GetRelevant(query string, n int) []*Episode {
-	// TODO(reconstruction-phase-2): real implementation pending
-	if n <= 0 {
+// Real relevance algorithm:
+//   - Tokenize the query and each candidate's combined content into
+//     lowercase words (split on whitespace + punctuation; drop tokens
+//     shorter than 3 characters).
+//   - For each candidate compute Jaccard similarity:
+//     |query_tokens ∩ candidate_tokens| / |query_tokens ∪ candidate_tokens|.
+//   - Rank descending by similarity; tie-break by recency (later
+//     Timestamp first).
+//   - Return the top `limit` candidates with similarity > 0.
+//
+// If `query` is empty an empty slice is returned (honest — nothing
+// matches no query). Honors ctx.Done().
+func (b *EpisodicMemoryBuffer) GetRelevant(ctx context.Context, query string, limit int) []*Episode {
+	if err := ctx.Err(); err != nil {
 		return nil
 	}
-	q := strings.ToLower(query)
+	if limit <= 0 {
+		return nil
+	}
+	qTokens := tokenize(query)
+	if len(qTokens) == 0 {
+		return nil
+	}
 	b.mu.RLock()
-	defer b.mu.RUnlock()
-	out := make([]*Episode, 0, n)
-	for _, ep := range b.episodes {
-		if matchesEpisode(ep, q) {
-			out = append(out, ep)
-			if len(out) >= n {
-				break
-			}
+	snapshot := make([]*Episode, len(b.episodes))
+	copy(snapshot, b.episodes)
+	b.mu.RUnlock()
+
+	type scored struct {
+		ep    *Episode
+		score float64
+	}
+	scoredAll := make([]scored, 0, len(snapshot))
+	for _, ep := range snapshot {
+		if err := ctx.Err(); err != nil {
+			return nil
 		}
+		if ep == nil {
+			continue
+		}
+		cTokens := tokenize(episodeContent(ep))
+		if len(cTokens) == 0 {
+			continue
+		}
+		s := jaccard(qTokens, cTokens)
+		if s <= 0 {
+			continue
+		}
+		scoredAll = append(scoredAll, scored{ep: ep, score: s})
+	}
+	sort.SliceStable(scoredAll, func(i, j int) bool {
+		if scoredAll[i].score != scoredAll[j].score {
+			return scoredAll[i].score > scoredAll[j].score
+		}
+		return scoredAll[i].ep.Timestamp.After(scoredAll[j].ep.Timestamp)
+	})
+	if len(scoredAll) > limit {
+		scoredAll = scoredAll[:limit]
+	}
+	out := make([]*Episode, len(scoredAll))
+	for i, s := range scoredAll {
+		out[i] = s.ep
 	}
 	return out
 }
 
-func matchesEpisode(ep *Episode, q string) bool {
-	if q == "" {
-		return false
+// episodeContent returns the concatenated text content of an episode
+// used by the token-overlap relevance scorer.
+func episodeContent(ep *Episode) string {
+	if ep == nil {
+		return ""
 	}
-	if strings.Contains(strings.ToLower(ep.TaskDescription), q) {
+	var sb strings.Builder
+	sb.WriteString(ep.TaskDescription)
+	sb.WriteString(" ")
+	sb.WriteString(ep.FailureAnalysis)
+	if ep.Reflection != nil {
+		sb.WriteString(" ")
+		sb.WriteString(ep.Reflection.RootCause)
+		sb.WriteString(" ")
+		sb.WriteString(ep.Reflection.WhatWentWrong)
+		sb.WriteString(" ")
+		sb.WriteString(ep.Reflection.WhatToChangeNext)
+	}
+	return sb.String()
+}
+
+// tokenize splits the supplied text into a set of lowercase tokens,
+// dropping any token shorter than 3 characters. Splitting happens on
+// any rune that is neither a letter nor a digit so punctuation is
+// dropped naturally.
+func tokenize(text string) map[string]struct{} {
+	tokens := make(map[string]struct{})
+	if text == "" {
+		return tokens
+	}
+	lower := strings.ToLower(text)
+	splitter := func(r rune) bool {
+		return !isWord(r)
+	}
+	for _, raw := range strings.FieldsFunc(lower, splitter) {
+		if len(raw) < 3 {
+			continue
+		}
+		tokens[raw] = struct{}{}
+	}
+	return tokens
+}
+
+// isWord reports whether the rune is a letter or a digit (i.e.
+// belongs to a token). Pure-ASCII fast path keeps the hot loop cheap.
+func isWord(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
 		return true
-	}
-	if strings.Contains(strings.ToLower(ep.FailureAnalysis), q) {
+	case r >= 'A' && r <= 'Z':
 		return true
-	}
-	if ep.Reflection != nil &&
-		strings.Contains(strings.ToLower(ep.Reflection.RootCause), q) {
+	case r >= '0' && r <= '9':
 		return true
 	}
 	return false
+}
+
+// jaccard returns the Jaccard similarity between two token sets.
+func jaccard(a, b map[string]struct{}) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	// Iterate the smaller set for the intersection count.
+	small, large := a, b
+	if len(b) < len(a) {
+		small, large = b, a
+	}
+	inter := 0
+	for tok := range small {
+		if _, ok := large[tok]; ok {
+			inter++
+		}
+	}
+	if inter == 0 {
+		return 0
+	}
+	union := len(a) + len(b) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
 }
 
 // =============================================================================
@@ -744,47 +864,92 @@ func (a *AccumulatedWisdom) GetAll() []*Wisdom {
 	return out
 }
 
-// GetRelevant returns up to `n` wisdom records whose pattern, domain,
-// or tags contain `query` (case-insensitive substring match).
+// GetRelevant returns up to `limit` wisdom records ranked by
+// token-overlap (Jaccard) similarity between the query and each
+// wisdom's text content (Pattern + Description + Domain + joined Tags).
 //
-// Honest-stub relevance: deterministic substring shortlist; real
-// embedding-based relevance is tracked in RECONSTRUCTION_ROADMAP.md.
-func (a *AccumulatedWisdom) GetRelevant(query string, n int) []*Wisdom {
-	// TODO(reconstruction-phase-2): real implementation pending
-	if n <= 0 {
+// Real relevance algorithm:
+//   - Tokenize the query and each wisdom's combined content into
+//     lowercase words (split on whitespace + punctuation; drop tokens
+//     shorter than 3 characters).
+//   - For each candidate compute Jaccard similarity:
+//     |query_tokens ∩ candidate_tokens| / |query_tokens ∪ candidate_tokens|.
+//   - Rank descending by similarity; tie-break by recency (later
+//     Timestamp first).
+//   - Return the top `limit` candidates with similarity > 0.
+//
+// If `query` is empty an empty slice is returned. Honors ctx.Done().
+func (a *AccumulatedWisdom) GetRelevant(ctx context.Context, query string, limit int) []*Wisdom {
+	if err := ctx.Err(); err != nil {
 		return nil
 	}
-	q := strings.ToLower(query)
+	if limit <= 0 {
+		return nil
+	}
+	qTokens := tokenize(query)
+	if len(qTokens) == 0 {
+		return nil
+	}
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	out := make([]*Wisdom, 0, n)
-	for _, w := range a.store {
-		if matchesWisdom(w, q) {
-			out = append(out, w)
-			if len(out) >= n {
-				break
-			}
+	snapshot := make([]*Wisdom, len(a.store))
+	copy(snapshot, a.store)
+	a.mu.RUnlock()
+
+	type scored struct {
+		w     *Wisdom
+		score float64
+	}
+	scoredAll := make([]scored, 0, len(snapshot))
+	for _, w := range snapshot {
+		if err := ctx.Err(); err != nil {
+			return nil
 		}
+		if w == nil {
+			continue
+		}
+		cTokens := tokenize(wisdomContent(w))
+		if len(cTokens) == 0 {
+			continue
+		}
+		s := jaccard(qTokens, cTokens)
+		if s <= 0 {
+			continue
+		}
+		scoredAll = append(scoredAll, scored{w: w, score: s})
+	}
+	sort.SliceStable(scoredAll, func(i, j int) bool {
+		if scoredAll[i].score != scoredAll[j].score {
+			return scoredAll[i].score > scoredAll[j].score
+		}
+		return scoredAll[i].w.Timestamp.After(scoredAll[j].w.Timestamp)
+	})
+	if len(scoredAll) > limit {
+		scoredAll = scoredAll[:limit]
+	}
+	out := make([]*Wisdom, len(scoredAll))
+	for i, s := range scoredAll {
+		out[i] = s.w
 	}
 	return out
 }
 
-func matchesWisdom(w *Wisdom, q string) bool {
-	if q == "" {
-		return false
+// wisdomContent returns the concatenated text content of a wisdom
+// record used by the token-overlap relevance scorer.
+func wisdomContent(w *Wisdom) string {
+	if w == nil {
+		return ""
 	}
-	if strings.Contains(strings.ToLower(w.Pattern), q) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(w.Domain), q) {
-		return true
-	}
+	var sb strings.Builder
+	sb.WriteString(w.Pattern)
+	sb.WriteString(" ")
+	sb.WriteString(w.Description)
+	sb.WriteString(" ")
+	sb.WriteString(w.Domain)
 	for _, tag := range w.Tags {
-		if strings.Contains(strings.ToLower(tag), q) {
-			return true
-		}
+		sb.WriteString(" ")
+		sb.WriteString(tag)
 	}
-	return false
+	return sb.String()
 }
 
 // RecordUsage records the outcome of applying a wisdom record. The
@@ -809,40 +974,74 @@ func (a *AccumulatedWisdom) RecordUsage(id string, success bool) error {
 	return nil
 }
 
-// ExtractFromEpisodes derives wisdom records from a list of episodes
-// by grouping their reflection root causes and emitting one Wisdom
-// per group of two or more episodes.
+// ExtractFromEpisodes mines recurring root-cause patterns out of the
+// supplied episodes and stores one Wisdom record per group of two or
+// more episodes that share a root cause.
 //
-// Honest-stub extraction: pattern = root cause; domain = "code";
-// tags = derived from agent IDs; frequency = group size. Real
-// pattern mining is tracked in RECONSTRUCTION_ROADMAP.md.
-func (a *AccumulatedWisdom) ExtractFromEpisodes(episodes []*Episode) ([]*Wisdom, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
+// Real pattern miner:
+//   - Episodes are grouped by their Reflection.RootCause (or, when
+//     Reflection or RootCause is empty, by the first significant
+//     token of the FailureAnalysis field).
+//   - Single-occurrence root causes are skipped — extraction requires
+//     a pattern to repeat at least twice.
+//   - For each surviving group a Wisdom is emitted with:
+//     Pattern     = group key (root cause / outcome token)
+//     Description = "Observed in N episodes: " + joined first-line summaries
+//     Frequency   = group size
+//     Confidence  = min(1.0, len(group) / 5.0)
+//     Source      = "extracted"
+//     Tags        = unique tokens common to every episode in the group
+//   - Each Wisdom is persisted via Store, which assigns a deterministic
+//     ID when one is not already present.
+//
+// Returns the freshly-extracted slice in deterministic (sorted key) order.
+// Honors ctx.Done().
+func (a *AccumulatedWisdom) ExtractFromEpisodes(ctx context.Context, episodes []*Episode) ([]*Wisdom, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	groups := make(map[string][]*Episode)
 	for _, ep := range episodes {
-		if ep == nil || ep.Reflection == nil || ep.Reflection.RootCause == "" {
+		if ep == nil {
 			continue
 		}
-		groups[ep.Reflection.RootCause] = append(groups[ep.Reflection.RootCause], ep)
+		key := episodeGroupKey(ep)
+		if key == "" {
+			continue
+		}
+		groups[key] = append(groups[key], ep)
 	}
-	out := make([]*Wisdom, 0)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Sort keys for deterministic output.
 	keys := make([]string, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	out := make([]*Wisdom, 0)
 	for _, k := range keys {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		eps := groups[k]
 		if len(eps) < 2 {
 			continue
 		}
-		tags := uniqueAgentIDs(eps)
+		confidence := float64(len(eps)) / 5.0
+		if confidence > 1.0 {
+			confidence = 1.0
+		}
 		w := &Wisdom{
-			Pattern:   k,
-			Frequency: len(eps),
-			Domain:    "code",
-			Tags:      tags,
+			Pattern:     k,
+			Description: buildExtractedDescription(eps),
+			Frequency:   len(eps),
+			Confidence:  confidence,
+			Source:      "extracted",
+			Domain:      "code",
+			Tags:        commonTokens(eps),
+			Timestamp:   time.Now(),
 		}
 		if err := a.Store(w); err != nil {
 			return out, err
@@ -852,18 +1051,99 @@ func (a *AccumulatedWisdom) ExtractFromEpisodes(episodes []*Episode) ([]*Wisdom,
 	return out, nil
 }
 
-func uniqueAgentIDs(eps []*Episode) []string {
-	seen := make(map[string]struct{})
-	var out []string
+// episodeGroupKey returns the group key for an episode used by the
+// pattern miner: prefer Reflection.RootCause; fall back to the first
+// significant token of FailureAnalysis.
+func episodeGroupKey(ep *Episode) string {
+	if ep == nil {
+		return ""
+	}
+	if ep.Reflection != nil {
+		rc := strings.TrimSpace(ep.Reflection.RootCause)
+		if rc != "" {
+			return rc
+		}
+	}
+	for _, tok := range strings.FieldsFunc(strings.ToLower(ep.FailureAnalysis), func(r rune) bool { return !isWord(r) }) {
+		if len(tok) >= 3 {
+			return tok
+		}
+	}
+	return ""
+}
+
+// buildExtractedDescription produces the human-readable description
+// for a Wisdom extracted from a group of episodes. Each episode
+// contributes its first-line summary (TaskDescription preferred,
+// FailureAnalysis as fallback).
+func buildExtractedDescription(eps []*Episode) string {
+	summaries := make([]string, 0, len(eps))
 	for _, ep := range eps {
 		if ep == nil {
 			continue
 		}
-		if _, ok := seen[ep.AgentID]; ok {
+		summary := firstLine(ep.TaskDescription)
+		if summary == "" {
+			summary = firstLine(ep.FailureAnalysis)
+		}
+		if summary == "" && ep.Reflection != nil {
+			summary = firstLine(ep.Reflection.WhatWentWrong)
+		}
+		if summary == "" {
+			summary = "(no summary)"
+		}
+		summaries = append(summaries, summary)
+	}
+	return fmt.Sprintf("Observed in %d episodes: %s", len(eps), strings.Join(summaries, " | "))
+}
+
+// firstLine returns the first non-empty trimmed line of the supplied
+// text.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// commonTokens returns the sorted token intersection across every
+// episode's combined content. Returns nil when the intersection is
+// empty.
+func commonTokens(eps []*Episode) []string {
+	if len(eps) == 0 {
+		return nil
+	}
+	var inter map[string]struct{}
+	for _, ep := range eps {
+		if ep == nil {
 			continue
 		}
-		seen[ep.AgentID] = struct{}{}
-		out = append(out, ep.AgentID)
+		toks := tokenize(episodeContent(ep))
+		if inter == nil {
+			inter = make(map[string]struct{}, len(toks))
+			for t := range toks {
+				inter[t] = struct{}{}
+			}
+			continue
+		}
+		for t := range inter {
+			if _, ok := toks[t]; !ok {
+				delete(inter, t)
+			}
+		}
+		if len(inter) == 0 {
+			return nil
+		}
+	}
+	if len(inter) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(inter))
+	for t := range inter {
+		out = append(out, t)
 	}
 	sort.Strings(out)
 	return out

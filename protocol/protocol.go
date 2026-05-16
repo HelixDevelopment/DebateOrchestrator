@@ -14,11 +14,30 @@ package protocol
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"digital.vasic.debate/topology"
 )
+
+// =============================================================================
+// Sentinel errors (debate-runner surface)
+// =============================================================================
+
+// ErrInvalidConfig is returned by Protocol.Execute when the bound
+// Config fails validation (empty Topic, non-positive MaxRounds, etc.).
+var ErrInvalidConfig = errors.New("debate/protocol: invalid config")
+
+// ErrNoAgentsConfigured is returned by Protocol.Execute when no
+// AgentInvoker has been registered via RegisterAgent before Execute
+// is called.
+var ErrNoAgentsConfigured = errors.New("debate/protocol: no agents configured")
 
 // =============================================================================
 // Wire-protocol surface (request/response/transport envelopes)
@@ -311,8 +330,49 @@ type Protocol struct {
 	Config Config
 	// Topology is the agent topology the Protocol runs against.
 	Topology topology.Topology
-	// Invoker is the AgentInvoker used to dispatch per-agent calls.
+	// Invoker is the AgentInvoker used to dispatch per-agent calls
+	// when no per-agent invoker has been registered. May be nil if
+	// callers exclusively use RegisterAgent.
 	Invoker AgentInvoker
+
+	// mu guards agents.
+	mu sync.RWMutex
+	// agents maps agent ID -> AgentInvoker. Populated via
+	// RegisterAgent; consulted by Execute to dispatch per-agent calls.
+	agents map[string]AgentInvoker
+}
+
+// RegisterAgent registers an AgentInvoker under the supplied agent
+// ID. Subsequent calls with the same ID replace the prior invoker.
+// Empty IDs and nil invokers are rejected.
+func (p *Protocol) RegisterAgent(id string, invoker AgentInvoker) error {
+	if id == "" {
+		return fmt.Errorf("%w: RegisterAgent empty id", ErrInvalidConfig)
+	}
+	if invoker == nil {
+		return fmt.Errorf("%w: RegisterAgent nil invoker for %q",
+			ErrInvalidConfig, id)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.agents == nil {
+		p.agents = make(map[string]AgentInvoker)
+	}
+	p.agents[id] = invoker
+	return nil
+}
+
+// Agents returns the registered agent IDs in stable sorted order so
+// Execute (and tests) iterate agents deterministically.
+func (p *Protocol) Agents() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	ids := make([]string, 0, len(p.agents))
+	for id := range p.agents {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // NewProtocol constructs a debate Protocol bound to the supplied
@@ -325,7 +385,11 @@ type Protocol struct {
 // opts[1] = AgentInvoker. Extra arguments are ignored to keep the
 // stub forward-compatible.
 func NewProtocol(cfg Config, opts ...interface{}) *Protocol {
-	p := &Protocol{Name: cfg.Name, Config: cfg}
+	p := &Protocol{
+		Name:   cfg.Name,
+		Config: cfg,
+		agents: make(map[string]AgentInvoker),
+	}
 	if len(opts) >= 1 {
 		if topo, ok := opts[0].(topology.Topology); ok {
 			p.Topology = topo
@@ -339,27 +403,319 @@ func NewProtocol(cfg Config, opts ...interface{}) *Protocol {
 	return p
 }
 
+// executionPhases is the canonical, executed-in-order phase list the
+// debate runner drives for every round. Kept narrow per the
+// orchestration spec (proposal -> critique -> refinement -> consensus)
+// so the runtime cost stays predictable and the per-phase responses
+// are mechanically distinguishable.
+var executionPhases = []topology.DebatePhase{
+	topology.PhaseProposal,
+	topology.PhaseCritique,
+	topology.PhaseOptimization, // "refinement"
+	topology.PhaseConvergence,  // "consensus"
+}
+
+// newDebateID returns a random 128-bit hex identifier suitable as a
+// debate ID. Falls back to a time-based ID if the system RNG is
+// unavailable so Execute never silently produces a colliding ID.
+func newDebateID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		return hex.EncodeToString(buf[:])
+	}
+	return fmt.Sprintf("debate-%d", time.Now().UnixNano())
+}
+
 // Execute runs the debate Protocol end-to-end and returns the
 // aggregated DebateResult.
 //
-// This is an honest stub: the runner returns an empty-but-non-nil
-// DebateResult with Success=false and a NotYetImplemented error so
-// callers can compose-test the surface today and discover the
-// missing implementation. Full implementation is tracked in
-// RECONSTRUCTION_ROADMAP.md.
+// Real orchestration runtime: validates the bound Config, initialises
+// a fresh DebateContext, then drives MaxRounds * len(executionPhases)
+// iterations. Each phase invokes every registered AgentInvoker with a
+// prompt composed from topic + phase + prior-round transcript;
+// per-agent responses are appended to the per-phase PhaseResult.
+// After every round a deterministic substring-similarity heuristic
+// produces a ConsensusResult; when EnableEarlyExit is set and the
+// confidence meets/exceeds MinConsensusScore the runtime exits
+// before MaxRounds. ctx.Done() is honoured at every loop boundary —
+// cancellation aborts and returns ctx.Err().
 func (p *Protocol) Execute(ctx context.Context) (*DebateResult, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	result := &DebateResult{
-		ID:           p.Config.Name,
-		Topic:        p.Config.Topic,
-		Success:      false,
-		TopologyUsed: p.Config.TopologyType,
-		Metrics:      &DebateMetrics{},
+
+	// (1) Validate config.
+	if strings.TrimSpace(p.Config.Topic) == "" {
+		return nil, fmt.Errorf("%w: Topic empty", ErrInvalidConfig)
 	}
-	return result, errors.New("debate/protocol: Execute NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+	if p.Config.MaxRounds <= 0 {
+		return nil, fmt.Errorf("%w: MaxRounds=%d (must be > 0)",
+			ErrInvalidConfig, p.Config.MaxRounds)
+	}
+
+	// (2) Snapshot registered agents (deterministic order).
+	agentIDs := p.Agents()
+	if len(agentIDs) == 0 {
+		return nil, ErrNoAgentsConfigured
+	}
+	p.mu.RLock()
+	invokers := make(map[string]AgentInvoker, len(agentIDs))
+	for _, id := range agentIDs {
+		invokers[id] = p.agents[id]
+	}
+	p.mu.RUnlock()
+
+	// (3) Build DebateContext + result skeleton.
+	debateID := newDebateID()
+	debateCtx := DebateContext{
+		ID:       debateID,
+		Topic:    p.Config.Topic,
+		Round:    0,
+		Metadata: copyMetadata(p.Config.Metadata),
+	}
+	result := &DebateResult{
+		ID:           debateID,
+		Topic:        p.Config.Topic,
+		TopologyUsed: p.Config.TopologyType,
+		Phases:       make([]*PhaseResult, 0,
+			p.Config.MaxRounds*len(executionPhases)),
+		Metrics: &DebateMetrics{},
+	}
+
+	debateStart := time.Now()
+
+	// Track responses across phases / rounds so prompt construction
+	// for later phases can incorporate earlier transcript.
+	var allResponses []*PhaseResponse
+	var lastConsensus *ConsensusResult
+	var earlyExit bool
+	var earlyExitReason string
+	roundsCompleted := 0
+
+	// (4) Drive rounds.
+RoundsLoop:
+	for round := 1; round <= p.Config.MaxRounds; round++ {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		debateCtx.Round = round
+
+		roundResponses := make([]*PhaseResponse, 0,
+			len(executionPhases)*len(agentIDs))
+
+		for _, phase := range executionPhases {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			debateCtx.CurrentPhase = phase
+
+			phaseStart := time.Now()
+			phaseResult := &PhaseResult{
+				Phase:     phase,
+				Round:     round,
+				Responses: make([]*PhaseResponse, 0, len(agentIDs)),
+			}
+
+			for _, id := range agentIDs {
+				if err := ctx.Err(); err != nil {
+					phaseResult.Duration = time.Since(phaseStart)
+					result.Phases = append(result.Phases, phaseResult)
+					return result, err
+				}
+				invoker := invokers[id]
+				prompt := buildPhasePrompt(
+					p.Config.Topic, p.Config.Context, phase, round,
+					allResponses)
+				agent := &topology.Agent{ID: id}
+				if p.Topology != nil {
+					if a, err := p.Topology.GetAgent(id); err == nil && a != nil {
+						agent = a
+					}
+				}
+
+				invokeStart := time.Now()
+				resp, invErr := invoker.Invoke(ctx, agent, prompt, debateCtx)
+				invokeLatency := time.Since(invokeStart)
+				result.Metrics.TotalInvocations++
+
+				if invErr != nil {
+					// Honour ctx.Err() over the wrapped invoker err
+					// so callers see context.Canceled when the
+					// cancellation is the real cause.
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						phaseResult.Duration = time.Since(phaseStart)
+						result.Phases = append(result.Phases, phaseResult)
+						return result, ctxErr
+					}
+					phaseResult.Duration = time.Since(phaseStart)
+					result.Phases = append(result.Phases, phaseResult)
+					return result, fmt.Errorf(
+						"debate/protocol: agent %q invoke failed at "+
+							"round %d phase %s: %w",
+						id, round, phase, invErr)
+				}
+				if resp == nil {
+					phaseResult.Duration = time.Since(phaseStart)
+					result.Phases = append(result.Phases, phaseResult)
+					return result, fmt.Errorf(
+						"debate/protocol: agent %q returned nil "+
+							"response at round %d phase %s",
+						id, round, phase)
+				}
+
+				// Fill missing-but-derivable response fields so
+				// downstream consumers always see real data.
+				if resp.AgentID == "" {
+					resp.AgentID = id
+				}
+				if resp.Phase == "" {
+					resp.Phase = phase
+				}
+				if resp.Timestamp.IsZero() {
+					resp.Timestamp = time.Now()
+				}
+				if resp.Latency == 0 {
+					resp.Latency = invokeLatency
+				}
+
+				phaseResult.Responses = append(phaseResult.Responses, resp)
+				roundResponses = append(roundResponses, resp)
+				allResponses = append(allResponses, resp)
+				result.Metrics.TotalResponses++
+			}
+
+			phaseResult.Duration = time.Since(phaseStart)
+			result.Phases = append(result.Phases, phaseResult)
+		}
+
+		// (5) Round-level consensus.
+		lastConsensus = computeConsensus(roundResponses)
+		roundsCompleted = round
+
+		// (6) Early-exit gate.
+		if p.Config.EnableEarlyExit &&
+			lastConsensus != nil &&
+			lastConsensus.Confidence >= p.Config.MinConsensusScore {
+			earlyExit = true
+			earlyExitReason = fmt.Sprintf(
+				"consensus confidence %.4f >= threshold %.4f at round %d",
+				lastConsensus.Confidence, p.Config.MinConsensusScore, round)
+			break RoundsLoop
+		}
+	}
+
+	result.RoundsCompleted = roundsCompleted
+	result.Duration = time.Since(debateStart)
+	result.EarlyExit = earlyExit
+	result.EarlyExitReason = earlyExitReason
+	result.FinalConsensus = lastConsensus
+	if lastConsensus != nil {
+		result.Content = lastConsensus.Choice
+	}
+	result.Success = roundsCompleted > 0 && len(result.Phases) > 0
+
+	return result, nil
+}
+
+// buildPhasePrompt composes the per-agent prompt for a given phase.
+// Real but minimal: emits topic, context, phase identifier, round
+// number, and a compact transcript of the prior responses so each
+// phase incorporates earlier work. No LLM dependency.
+func buildPhasePrompt(topic, debateCtx string, phase topology.DebatePhase,
+	round int, prior []*PhaseResponse) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Debate topic: %s\n", topic)
+	if debateCtx != "" {
+		fmt.Fprintf(&sb, "Context: %s\n", debateCtx)
+	}
+	fmt.Fprintf(&sb, "Round: %d\n", round)
+	fmt.Fprintf(&sb, "Phase: %s\n", string(phase))
+	if len(prior) > 0 {
+		sb.WriteString("Prior responses:\n")
+		// Cap to last 16 to keep prompt bounded.
+		start := 0
+		if len(prior) > 16 {
+			start = len(prior) - 16
+		}
+		for _, r := range prior[start:] {
+			fmt.Fprintf(&sb, "- [%s/%s] %s\n",
+				r.AgentID, string(r.Phase), r.Content)
+		}
+	}
+	return sb.String()
+}
+
+// computeConsensus produces a deterministic ConsensusResult from a
+// slice of round-level PhaseResponses. The heuristic: tally the
+// trimmed Content of every response, declare the most frequent
+// content the Choice, compute Confidence as
+// freq(choice) / total_responses, and list every contributor that
+// produced the chosen content. Empty input returns nil.
+func computeConsensus(responses []*PhaseResponse) *ConsensusResult {
+	if len(responses) == 0 {
+		return nil
+	}
+	counts := make(map[string]int, len(responses))
+	contribs := make(map[string][]string, len(responses))
+	for _, r := range responses {
+		if r == nil {
+			continue
+		}
+		key := strings.TrimSpace(r.Content)
+		if key == "" {
+			continue
+		}
+		counts[key]++
+		contribs[key] = append(contribs[key], r.AgentID)
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+
+	// Sort keys for determinism, then pick highest-count with
+	// lexicographically smallest content as tie-breaker.
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	bestKey := keys[0]
+	bestCount := counts[bestKey]
+	for _, k := range keys[1:] {
+		if counts[k] > bestCount {
+			bestKey = k
+			bestCount = counts[k]
+		}
+	}
+
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	confidence := 0.0
+	if total > 0 {
+		confidence = float64(bestCount) / float64(total)
+	}
+
+	return &ConsensusResult{
+		Choice:       bestKey,
+		Confidence:   confidence,
+		Contributors: append([]string(nil), contribs[bestKey]...),
+	}
+}
+
+// copyMetadata returns a defensive shallow copy of a metadata map so
+// the debate runtime cannot accidentally mutate caller-owned state.
+func copyMetadata(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 // ExecuteRequest dispatches a wire-protocol request through the
