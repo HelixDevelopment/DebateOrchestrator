@@ -36,7 +36,7 @@ type OrchestratorConfig struct {
 func DefaultOrchestratorConfig() OrchestratorConfig {
 	return OrchestratorConfig{
 		EnableLearning:            true,
-		EnableCrossDebateLearning: false,
+		EnableCrossDebateLearning: true,
 		MinAgentsPerDebate:        2,
 		DefaultMaxRounds:          3,
 		DefaultTimeout:            30 * time.Second,

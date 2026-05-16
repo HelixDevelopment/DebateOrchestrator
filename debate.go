@@ -35,13 +35,24 @@ type LessonBankConfig struct {
 	// StoragePath is the on-disk path for persistence. Empty means
 	// memory-only. Persistence is not yet implemented.
 	StoragePath string
+	// MaxLessons is the soft cap on stored lessons. The current
+	// implementation tracks the cap but does not actively evict
+	// over-cap entries — eviction lands with the real persistence
+	// implementation tracked in RECONSTRUCTION_ROADMAP.md.
+	MaxLessons int
+	// MinConfidence is the minimum 0..1 confidence below which Add
+	// will silently drop incoming lessons. A value of 0 disables
+	// the filter.
+	MinConfidence float64
 }
 
 // DefaultLessonBankConfig returns the canonical default configuration.
 func DefaultLessonBankConfig() LessonBankConfig {
 	return LessonBankConfig{
-		EnableSemanticSearch: false,
+		EnableSemanticSearch: true,
 		StoragePath:          "",
+		MaxLessons:           1024,
+		MinConfidence:        0.1,
 	}
 }
 

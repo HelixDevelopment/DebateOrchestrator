@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReflexionStubsReturnNotYetImplemented(t *testing.T) {
@@ -18,8 +19,11 @@ func TestReflexionStubsReturnNotYetImplemented(t *testing.T) {
 		t.Fatalf("EpisodicMemoryBuffer.Append: %v", err)
 	}
 	g := NewReflectionGenerator(nil)
-	if _, err := g.Generate(ctx, nil); err == nil || !strings.Contains(err.Error(), "NotYetImplemented") {
-		t.Fatalf("ReflectionGenerator.Generate: %v", err)
+	// Generate with nil input now reports a typed-error sentinel that
+	// still carries the actionable RECONSTRUCTION_ROADMAP.md pointer.
+	if _, err := g.Generate(ctx, nil); err == nil ||
+		!strings.Contains(err.Error(), "RECONSTRUCTION_ROADMAP.md") {
+		t.Fatalf("ReflectionGenerator.Generate(nil): expected RECONSTRUCTION_ROADMAP.md pointer, got %v", err)
 	}
 	l := NewReflexionLoop(cfg, g, nil, b)
 	if _, err := l.Run(ctx, nil); err == nil || !strings.Contains(err.Error(), "NotYetImplemented") {
@@ -28,5 +32,108 @@ func TestReflexionStubsReturnNotYetImplemented(t *testing.T) {
 	a := NewAccumulatedWisdom()
 	if err := a.Persist(ctx); err == nil || !strings.Contains(err.Error(), "NotYetImplemented") {
 		t.Fatalf("AccumulatedWisdom.Persist: %v", err)
+	}
+}
+
+func TestEpisodicMemoryBuffer_StoreGetSize(t *testing.T) {
+	b := NewEpisodicMemoryBuffer(3)
+	for i := 0; i < 5; i++ {
+		ep := &Episode{
+			AgentID:         "a",
+			TaskDescription: "task",
+			Code:            "code",
+			Confidence:      0.5,
+			Timestamp:       time.Now(),
+		}
+		if err := b.Store(ep); err != nil {
+			t.Fatalf("Store: %v", err)
+		}
+	}
+	if got := b.Size(); got != 3 {
+		t.Fatalf("Size after 5 stores into cap=3: got %d, want 3 (FIFO eviction)", got)
+	}
+	if all := b.GetAll(); len(all) != 3 {
+		t.Fatalf("GetAll: got %d, want 3", len(all))
+	}
+	if recent := b.GetRecent(2); len(recent) != 2 {
+		t.Fatalf("GetRecent(2): got %d, want 2", len(recent))
+	}
+	if byAgent := b.GetByAgent("a"); len(byAgent) != 3 {
+		t.Fatalf("GetByAgent(a): got %d, want 3", len(byAgent))
+	}
+	if byAgent := b.GetByAgent("ghost"); len(byAgent) != 0 {
+		t.Fatalf("GetByAgent(ghost): got %d, want 0", len(byAgent))
+	}
+}
+
+func TestReflectionGenerator_FallbackProducesReflection(t *testing.T) {
+	g := NewReflectionGenerator(nil) // no LLM client → fallback path
+	req := &ReflectionRequest{
+		Code:            "func divide(a, b int) int { return a / b }",
+		ErrorMessages:   []string{"runtime error: integer divide by zero"},
+		TaskDescription: "Implement safe division function",
+		AttemptNumber:   1,
+	}
+	r, err := g.Generate(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Generate: unexpected error %v", err)
+	}
+	if r == nil || r.RootCause == "" || r.WhatToChangeNext == "" {
+		t.Fatalf("Generate: fallback should populate RootCause + WhatToChangeNext; got %+v", r)
+	}
+	if r.ConfidenceInFix <= 0 {
+		t.Fatalf("Generate: fallback should report >0 confidence, got %v", r.ConfidenceInFix)
+	}
+}
+
+func TestAccumulatedWisdom_StoreRecordUsage(t *testing.T) {
+	a := NewAccumulatedWisdom()
+	w := &Wisdom{Pattern: "nil pointer dereference", Frequency: 3, Domain: "code", Tags: []string{"runtime"}}
+	if err := a.Store(w); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if w.ID == "" {
+		t.Fatalf("Store: expected generated ID, got empty")
+	}
+	if got := a.Size(); got != 1 {
+		t.Fatalf("Size = %d, want 1", got)
+	}
+	if err := a.RecordUsage(w.ID, true); err != nil {
+		t.Fatalf("RecordUsage true: %v", err)
+	}
+	if err := a.RecordUsage(w.ID, false); err != nil {
+		t.Fatalf("RecordUsage false: %v", err)
+	}
+	all := a.GetAll()
+	if len(all) != 1 {
+		t.Fatalf("GetAll: got %d, want 1", len(all))
+	}
+	if all[0].UseCount != 2 {
+		t.Fatalf("UseCount = %d, want 2", all[0].UseCount)
+	}
+	if all[0].SuccessRate < 0.49 || all[0].SuccessRate > 0.51 {
+		t.Fatalf("SuccessRate = %v, want ~0.5", all[0].SuccessRate)
+	}
+	if rel := a.GetRelevant("nil pointer", 5); len(rel) != 1 {
+		t.Fatalf("GetRelevant: got %d, want 1", len(rel))
+	}
+}
+
+func TestAccumulatedWisdom_ExtractFromEpisodes(t *testing.T) {
+	a := NewAccumulatedWisdom()
+	episodes := []*Episode{
+		{AgentID: "x", Reflection: &Reflection{RootCause: "nil deref"}},
+		{AgentID: "y", Reflection: &Reflection{RootCause: "nil deref"}},
+		{AgentID: "z", Reflection: &Reflection{RootCause: "isolated"}},
+	}
+	out, err := a.ExtractFromEpisodes(episodes)
+	if err != nil {
+		t.Fatalf("ExtractFromEpisodes: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("ExtractFromEpisodes: got %d patterns, want 1 (frequency>=2 filter)", len(out))
+	}
+	if out[0].Frequency != 2 {
+		t.Fatalf("ExtractFromEpisodes: pattern frequency = %d, want 2", out[0].Frequency)
 	}
 }

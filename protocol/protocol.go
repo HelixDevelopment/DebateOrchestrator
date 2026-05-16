@@ -1,25 +1,28 @@
 // Package protocol hosts the wire-protocol surface for debate
 // orchestration: request/response message envelopes, transport
-// constructors, and the HelixAgent client adapter. The current
-// implementation is an honest stub at the transport/execution layer
-// — constructors return real-but-empty values so callers can compose
-// struct literals, but every transport and protocol method returns an
-// explicit NotYetImplemented error so callers cannot mistake a stub
-// for a working endpoint. Full implementation is tracked in
-// RECONSTRUCTION_ROADMAP.md.
+// constructors, the HelixAgent client adapter, and the
+// in-process debate Protocol runner.
+//
+// The current implementation is an honest stub at the transport/
+// execution layer — constructors return real-but-empty values so
+// callers can compose struct literals, but every transport and
+// debate-protocol method returns an explicit
+// `errors.New("debate/protocol: <Method> NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")`
+// error so callers cannot mistake a stub for a working endpoint.
+// Full implementation is tracked in RECONSTRUCTION_ROADMAP.md.
 package protocol
 
 import (
 	"context"
 	"errors"
 	"time"
+
+	"digital.vasic.debate/topology"
 )
 
-// Protocol is the top-level protocol handler.
-type Protocol struct {
-	// Name identifies the protocol instance.
-	Name string
-}
+// =============================================================================
+// Wire-protocol surface (request/response/transport envelopes)
+// =============================================================================
 
 // Standard implements the standard request/response surface.
 type Standard struct {
@@ -27,40 +30,10 @@ type Standard struct {
 	Name string
 }
 
-// Config configures a Protocol at construction time.
-type Config struct {
-	// Name identifies the protocol configuration.
-	Name string
-	// Version is the protocol version string.
-	Version string
-	// Timeout is the per-request timeout.
-	Timeout time.Duration
-}
-
 // FileConfig configures a file-backed transport.
 type FileConfig struct {
 	// Path is the on-disk path the transport will use.
 	Path string
-}
-
-// DebateContext carries per-debate metadata across protocol calls.
-type DebateContext struct {
-	// ID is the debate identifier.
-	ID string
-	// Topic is the debate topic.
-	Topic string
-	// Metadata is free-form per-debate metadata.
-	Metadata map[string]interface{}
-}
-
-// DebateResult captures the outcome of a debate.
-type DebateResult struct {
-	// ID is the debate identifier the result corresponds to.
-	ID string
-	// Success indicates whether the debate completed successfully.
-	Success bool
-	// Content is the result content (typically the conclusion).
-	Content string
 }
 
 // Message is a single chat-style message exchanged with an agent.
@@ -165,27 +138,254 @@ type InitializeResult struct {
 	ServerInfo string
 }
 
-// PhaseResponse captures a per-phase response from a federated agent.
-type PhaseResponse struct {
-	// Phase is the phase identifier.
-	Phase string
-	// Content is the per-phase content.
-	Content string
-}
-
 // HelixAgentClient is the adapter for talking to a HelixAgent peer.
 type HelixAgentClient struct{}
 
-// AgentInvoker is the function signature used to invoke an agent in
-// process — kept as a function type so tests can pass closures.
-type AgentInvoker func(ctx context.Context, prompt string) (string, error)
+// =============================================================================
+// Debate-protocol surface (Config, Protocol runner, AgentInvoker, results)
+// =============================================================================
 
-// NewProtocol constructs a Protocol from the supplied configuration.
-// The returned protocol is a real, empty handler; Execute is currently
-// stubbed.
-func NewProtocol(cfg Config) (*Protocol, error) {
-	return &Protocol{Name: cfg.Name}, nil
+// Config configures the debate Protocol at construction time. It
+// carries both wire-protocol identity (Name/Version) and per-debate
+// runner knobs (Topic/Context/MaxRounds/Timeout/…) so the legacy
+// transport callers and the new debate runner can share it.
+type Config struct {
+	// Name identifies the protocol/debate configuration.
+	Name string
+	// Version is the protocol version string.
+	Version string
+	// Timeout is the overall per-debate timeout.
+	Timeout time.Duration
+
+	// Topic is the human-readable debate topic.
+	Topic string
+	// Context is supplementary debate context.
+	Context string
+	// MaxRounds caps the number of debate rounds.
+	MaxRounds int
+	// EnableEarlyExit allows the debate to terminate when consensus
+	// is reached before MaxRounds.
+	EnableEarlyExit bool
+	// MinConsensusScore is the consensus threshold for early exit.
+	MinConsensusScore float64
+	// TopologyType is the topology type the debate executes against
+	// (informational — the actual Topology is passed to NewProtocol).
+	TopologyType topology.TopologyType
+	// Metadata is free-form per-debate metadata.
+	Metadata map[string]interface{}
 }
+
+// DebateContext carries per-debate, per-phase metadata across
+// AgentInvoker calls.
+type DebateContext struct {
+	// ID is the debate identifier.
+	ID string
+	// Topic is the debate topic.
+	Topic string
+	// Round is the current 1-based round number.
+	Round int
+	// CurrentPhase is the current debate phase.
+	CurrentPhase topology.DebatePhase
+	// Metadata is free-form per-debate metadata.
+	Metadata map[string]interface{}
+}
+
+// PhaseResponse captures a per-phase response from a federated agent.
+type PhaseResponse struct {
+	// AgentID identifies the responding agent.
+	AgentID string
+	// Role is the responding agent's role.
+	Role topology.AgentRole
+	// Provider is the responding agent's provider.
+	Provider string
+	// Model is the responding agent's model identifier.
+	Model string
+	// Phase is the phase identifier the response belongs to.
+	Phase topology.DebatePhase
+	// Content is the per-phase response content.
+	Content string
+	// Confidence is the agent's self-reported confidence.
+	Confidence float64
+	// Vote is the agent's vote in a convergence phase.
+	Vote string
+	// Score is the agent's heuristic score.
+	Score float64
+	// Latency is the wall-clock latency of the agent invocation.
+	Latency time.Duration
+	// Timestamp is the response timestamp.
+	Timestamp time.Time
+	// Arguments is the agent's structured argument list.
+	Arguments []string
+	// Suggestions is the agent's structured suggestion list.
+	Suggestions []string
+	// Metadata is free-form per-response metadata.
+	Metadata map[string]interface{}
+}
+
+// PhaseResult captures the outcome of a single debate phase.
+type PhaseResult struct {
+	// Phase is the phase identifier.
+	Phase topology.DebatePhase
+	// Round is the 1-based round number this phase executed in.
+	Round int
+	// Responses is the list of per-agent responses collected.
+	Responses []*PhaseResponse
+	// Duration is the wall-clock duration of the phase.
+	Duration time.Duration
+}
+
+// DebateMetrics aggregates per-debate counters.
+type DebateMetrics struct {
+	// TotalResponses is the total number of agent responses
+	// collected across all phases.
+	TotalResponses int
+	// TotalInvocations is the total number of AgentInvoker calls.
+	TotalInvocations int
+}
+
+// ConsensusResult captures the convergence outcome of a debate.
+type ConsensusResult struct {
+	// Choice is the consensus choice.
+	Choice string
+	// Confidence is the consensus confidence.
+	Confidence float64
+	// Contributors lists the agent IDs that contributed to consensus.
+	Contributors []string
+}
+
+// DebateResult captures the outcome of a debate run.
+type DebateResult struct {
+	// ID is the debate identifier the result corresponds to.
+	ID string
+	// Topic is the debate topic (echo of Config.Topic).
+	Topic string
+	// Success indicates whether the debate completed successfully.
+	Success bool
+	// Content is the result content (typically the conclusion).
+	Content string
+	// RoundsCompleted is the number of rounds actually completed.
+	RoundsCompleted int
+	// TopologyUsed is the topology type the debate ran against.
+	TopologyUsed topology.TopologyType
+	// Phases is the per-phase result list in execution order.
+	Phases []*PhaseResult
+	// Metrics is the aggregate metrics for the debate.
+	Metrics *DebateMetrics
+	// Duration is the wall-clock duration of the entire debate.
+	Duration time.Duration
+	// EarlyExit is true if the debate exited before MaxRounds.
+	EarlyExit bool
+	// EarlyExitReason is the reason the debate exited early.
+	EarlyExitReason string
+	// FinalConsensus is the consensus outcome, if any.
+	FinalConsensus *ConsensusResult
+}
+
+// AgentInvoker is the abstraction the debate Protocol uses to
+// invoke a single agent at a given phase. Implementations may bind
+// to a live LLM, a canned response generator, or any other backing
+// surface.
+type AgentInvoker interface {
+	// Invoke runs the agent for the supplied prompt within the
+	// supplied debate context and returns the agent's per-phase
+	// response.
+	Invoke(ctx context.Context, agent *topology.Agent, prompt string,
+		debateCtx DebateContext) (*PhaseResponse, error)
+}
+
+// AgentInvokerFunc is a function adapter for AgentInvoker.
+type AgentInvokerFunc func(ctx context.Context, agent *topology.Agent,
+	prompt string, debateCtx DebateContext) (*PhaseResponse, error)
+
+// Invoke satisfies AgentInvoker by delegating to the wrapped function.
+func (f AgentInvokerFunc) Invoke(ctx context.Context, agent *topology.Agent,
+	prompt string, debateCtx DebateContext) (*PhaseResponse, error) {
+	return f(ctx, agent, prompt, debateCtx)
+}
+
+// Protocol is the in-process debate Protocol runner.
+type Protocol struct {
+	// Name identifies the protocol instance.
+	Name string
+	// Config is the configuration this Protocol was built from.
+	Config Config
+	// Topology is the agent topology the Protocol runs against.
+	Topology topology.Topology
+	// Invoker is the AgentInvoker used to dispatch per-agent calls.
+	Invoker AgentInvoker
+}
+
+// NewProtocol constructs a debate Protocol bound to the supplied
+// Config, Topology, and AgentInvoker.
+//
+// Both signatures are supported via variadic opts so callers can
+// continue to call `NewProtocol(cfg)` (legacy transport wiring) or
+// the new `NewProtocol(cfg, topo, invoker)` form (debate runner).
+// The variadic form is decoded positionally — opts[0] = Topology,
+// opts[1] = AgentInvoker. Extra arguments are ignored to keep the
+// stub forward-compatible.
+func NewProtocol(cfg Config, opts ...interface{}) *Protocol {
+	p := &Protocol{Name: cfg.Name, Config: cfg}
+	if len(opts) >= 1 {
+		if topo, ok := opts[0].(topology.Topology); ok {
+			p.Topology = topo
+		}
+	}
+	if len(opts) >= 2 {
+		if inv, ok := opts[1].(AgentInvoker); ok {
+			p.Invoker = inv
+		}
+	}
+	return p
+}
+
+// Execute runs the debate Protocol end-to-end and returns the
+// aggregated DebateResult.
+//
+// This is an honest stub: the runner returns an empty-but-non-nil
+// DebateResult with Success=false and a NotYetImplemented error so
+// callers can compose-test the surface today and discover the
+// missing implementation. Full implementation is tracked in
+// RECONSTRUCTION_ROADMAP.md.
+func (p *Protocol) Execute(ctx context.Context) (*DebateResult, error) {
+	// TODO(reconstruction-phase-2): real implementation pending
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := &DebateResult{
+		ID:           p.Config.Name,
+		Topic:        p.Config.Topic,
+		Success:      false,
+		TopologyUsed: p.Config.TopologyType,
+		Metrics:      &DebateMetrics{},
+	}
+	return result, errors.New("debate/protocol: Execute NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+}
+
+// ExecuteRequest dispatches a wire-protocol request through the
+// Protocol envelope (legacy transport surface).
+func (p *Protocol) ExecuteRequest(ctx context.Context, req *Request) (*Response, error) {
+	// TODO(reconstruction-phase-2): real implementation pending
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	_ = req
+	return nil, errors.New("debate/protocol: ExecuteRequest NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+}
+
+// HandleFederatedRequest dispatches a federated protocol request.
+func (p *Protocol) HandleFederatedRequest(ctx context.Context, req *Request) (*Response, error) {
+	// TODO(reconstruction-phase-2): real implementation pending
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	_ = req
+	return nil, errors.New("debate/protocol: HandleFederatedRequest NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
+}
+
+// =============================================================================
+// Construction helpers (transport / standard / config)
+// =============================================================================
 
 // NewStandard constructs a Standard with default identity.
 func NewStandard() *Standard {
@@ -206,8 +406,19 @@ func NewPipeTransport() (interface{}, error) {
 }
 
 // DefaultDebateConfig returns the canonical default debate config.
+// All knobs the debate runner consults have sensible defaults so
+// callers can construct a working Config via a single function call
+// plus targeted overrides.
 func DefaultDebateConfig() Config {
-	return Config{Name: "default", Version: "1.0", Timeout: 30 * time.Second}
+	return Config{
+		Name:              "default",
+		Version:           "1.0",
+		Timeout:           30 * time.Second,
+		MaxRounds:         3,
+		EnableEarlyExit:   true,
+		MinConsensusScore: 0.7,
+		TopologyType:      topology.TopologyGraphMesh,
+	}
 }
 
 // GetString fetches a string value from a free-form parameter map.
@@ -238,26 +449,6 @@ func Name() string {
 // capability negotiation is tracked in RECONSTRUCTION_ROADMAP.md.
 func GetCapabilities() []string {
 	return []string{}
-}
-
-// Execute dispatches a protocol request.
-func (p *Protocol) Execute(ctx context.Context, req *Request) (*Response, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	_ = req
-	return nil, errors.New("debate/protocol: Execute NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
-}
-
-// HandleFederatedRequest dispatches a federated protocol request.
-func (p *Protocol) HandleFederatedRequest(ctx context.Context, req *Request) (*Response, error) {
-	// TODO(reconstruction-phase-2): real implementation pending
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	_ = req
-	return nil, errors.New("debate/protocol: HandleFederatedRequest NotYetImplemented — see RECONSTRUCTION_ROADMAP.md")
 }
 
 // Initialize performs the protocol initialise handshake.
