@@ -1,0 +1,34 @@
+# Build artefacts
+/bin/
+/build/
+/dist/
+/out/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.test
+
+# Cache
+.cache/
+
+# Temp
+*.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Coverage / reports
+*.log
+coverage.out
+coverage.html
+
+# Editor state
+.idea/
+.vscode/
+
+# Go
+vendor/
