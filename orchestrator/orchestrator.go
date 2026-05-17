@@ -400,10 +400,16 @@ func (o *Orchestrator) generateID(topic string) string {
 	return "debate-" + hex.EncodeToString(sum[:6])
 }
 
-// synthesiseContent produces deterministic, non-bluff content derived
-// from a hash of (topic, agentID, round). The content is clearly
-// labelled as synthesised so a downstream consumer cannot mistake it
-// for real LLM output.
+// synthesiseContent produces deterministic stub content derived from
+// a hash of (topic, agentID, round). The content carries an explicit
+// `[synthesised ... deterministic-stub-content awaiting provider
+// wiring]` marker so a downstream consumer scanning Content for the
+// substring "synthesised" can detect that no real LLM call was made.
+//
+// §11.4 status: this is an ACKNOWLEDGED-STUB path — the function's
+// output is self-labelled as a stub. Replacing this with real LLM
+// dispatch via a ProviderInvoker injection is the canonical fix
+// (round-17 deferral; see docs/CONTINUATION.md close-out⁸²).
 func synthesiseContent(topic, agentID string, round int) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d", topic, agentID, round)))
 	digest := hex.EncodeToString(sum[:4])
@@ -426,9 +432,17 @@ func scoreToConfidence(score float64, round int) float64 {
 	return adj
 }
 
-// simulatedLatency returns a deterministic per-call latency for metrics.
+// simulatedLatency returns 0 as the sentinel for "no real LLM call
+// was made, so no real latency was measured".
+//
+// Previously this returned a deterministic hash-based fake value
+// (10-60 ms range) that was stored in AgentResponse.Latency and
+// summed into totalLatency. Any caller asserting latency metrics
+// PASSed against the fake value — a §11.4 PASS-bluff. Real latency
+// measurement requires wiring real provider calls (round-17
+// deferral); until then, 0 sentinel is the honest signal.
 func simulatedLatency(agentID string, round int) time.Duration {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", agentID, round)))
-	ms := int(sum[0])%50 + 10
-	return time.Duration(ms) * time.Millisecond
+	_ = agentID
+	_ = round
+	return 0
 }
