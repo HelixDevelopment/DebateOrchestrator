@@ -502,15 +502,26 @@ func NewProtocol(cfg Config, opts ...interface{}) *Protocol {
 }
 
 // executionPhases is the canonical, executed-in-order phase list the
-// debate runner drives for every round. Kept narrow per the
-// orchestration spec (proposal -> critique -> refinement -> consensus)
-// so the runtime cost stays predictable and the per-phase responses
-// are mechanically distinguishable.
+// debate runner drives for every round. Implements the full 8-phase
+// MASTER protocol per topology.DebatePhase: Dehallucination →
+// SelfEvolvement → Proposal → Critique → Review → Optimization →
+// Adversarial → Convergence. Per-phase responses stay mechanically
+// distinguishable because the agent-prompt composer includes the
+// CurrentPhase as a discriminator (see buildAgentPrompt in this file).
+//
+// Close-out⁷⁵: the prior 4-phase subset (Proposal/Critique/Optimization/
+// Convergence) was a partial implementation that left
+// TestDebateFullProtocol_8Phases honestly FAILing. Expanded to the
+// full 8 phases per the topology contract.
 var executionPhases = []topology.DebatePhase{
+	topology.PhaseDehallucination,
+	topology.PhaseSelfEvolvement,
 	topology.PhaseProposal,
 	topology.PhaseCritique,
+	topology.PhaseReview,
 	topology.PhaseOptimization, // "refinement"
-	topology.PhaseConvergence,  // "consensus"
+	topology.PhaseAdversarial,
+	topology.PhaseConvergence, // "consensus"
 }
 
 // newDebateID returns a random 128-bit hex identifier suitable as a
