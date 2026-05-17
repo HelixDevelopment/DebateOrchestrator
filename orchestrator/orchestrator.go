@@ -16,16 +16,19 @@ import (
 
 // Orchestrator is the central engine that coordinates debate sessions.
 //
-// The current implementation is REAL but deterministic: ConductDebate
-// executes real rounds, builds real responses, captures real timings,
-// and produces real metrics — but agent content is synthesised from a
-// hash of (topic, agentID) rather than calling a real LLM. Real
-// provider wiring is tracked in RECONSTRUCTION_ROADMAP.md.
+// When `invoker` is wired (via WithProviderInvoker option), the
+// orchestrator calls it for every agent response and measures real
+// wall-clock latency. When `invoker` is nil, falls back to the
+// deterministic synthesised content + zero-latency sentinel — content
+// is self-labelled "[synthesised ... awaiting provider wiring]" so any
+// downstream consumer scanning Content for the marker can detect that
+// no real LLM call was made (§11.4 ACK-STUB disclosure).
 type Orchestrator struct {
 	cfg      OrchestratorConfig
 	registry ProviderRegistry
 	bank     *debate.LessonBank
 	pool     *AgentPool
+	invoker  ProviderInvoker
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
@@ -38,21 +41,42 @@ type Orchestrator struct {
 	idCounter     atomic.Int64
 }
 
+// WithProviderInvoker injects a ProviderInvoker callback the
+// orchestrator will use for every agent response. When unset, the
+// orchestrator falls back to the deterministic synthesised-content
+// stub (with explicit "[synthesised ... awaiting provider wiring]"
+// marker in Content so consumers can detect it).
+//
+// The callback should make a real HTTP/gRPC call to the LLM provider
+// and return the model's response text. Errors are propagated into
+// AgentResponse.Content as `[invoker-error: <err>]` so the round
+// continues but the consumer sees the failure mode.
+func WithProviderInvoker(invoker ProviderInvoker) Option {
+	return func(o *Orchestrator) {
+		o.invoker = invoker
+	}
+}
+
 // NewOrchestrator constructs an Orchestrator. registry may be nil; in
 // that case provider registration succeeds locally but cannot resolve
 // LLMs. bank may be nil; in that case learning persistence is disabled.
 // cfg is taken by value — any invalid field is normalised against
 // DefaultOrchestratorConfig() rather than being rejected, so callers
-// don't need a two-variable assignment.
-func NewOrchestrator(registry ProviderRegistry, bank *debate.LessonBank, cfg OrchestratorConfig) *Orchestrator {
+// don't need a two-variable assignment. Additional opts can wire a
+// ProviderInvoker for real LLM dispatch (see WithProviderInvoker).
+func NewOrchestrator(registry ProviderRegistry, bank *debate.LessonBank, cfg OrchestratorConfig, opts ...Option) *Orchestrator {
 	resolved := normaliseOrchestratorConfig(cfg)
-	return &Orchestrator{
+	o := &Orchestrator{
 		cfg:      resolved,
 		registry: registry,
 		bank:     bank,
 		pool:     NewAgentPool(),
 		sessions: make(map[string]*Session),
 	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
 }
 
 // New is an alias for NewOrchestrator preserved for API-callers that
@@ -262,9 +286,8 @@ func (o *Orchestrator) ConductDebate(ctx context.Context, req *DebateRequest) (*
 			Responses: make([]*AgentResponse, 0, len(participants)),
 		}
 		for _, agent := range participants {
-			content := synthesiseContent(resolved.Topic, agent.ID, round)
+			content, latency := o.invokeAgent(ctx, resolved.Topic, agent, round)
 			confidence := scoreToConfidence(agent.Score, round)
-			latency := simulatedLatency(agent.ID, round)
 			tokens := len(content) / 4
 			phase.Responses = append(phase.Responses, &AgentResponse{
 				AgentID:    agent.ID,
@@ -398,6 +421,49 @@ func (o *Orchestrator) generateID(topic string) string {
 	n := o.idCounter.Add(1)
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", topic, time.Now().UnixNano(), n)))
 	return "debate-" + hex.EncodeToString(sum[:6])
+}
+
+// invokeAgent dispatches one agent response. When a ProviderInvoker
+// is wired (via WithProviderInvoker), it calls the invoker with a
+// prompt built from (topic, agent, round) and measures real
+// wall-clock latency around the call. When the invoker errors, the
+// content carries an explicit `[invoker-error: ...]` marker so the
+// round continues but consumers see the failure mode. When no
+// invoker is wired, falls back to the deterministic
+// synthesiseContent stub (with explicit "[synthesised ...]" marker
+// per §11.4 ACK-STUB) and zero-latency sentinel.
+func (o *Orchestrator) invokeAgent(ctx context.Context, topic string, agent *Agent, round int) (string, time.Duration) {
+	if o.invoker == nil {
+		return synthesiseContent(topic, agent.ID, round), 0
+	}
+	prompt := buildAgentPrompt(topic, agent, round)
+	start := time.Now()
+	resp, err := o.invoker(ctx, prompt)
+	latency := time.Since(start)
+	if err != nil {
+		// Real-call failure: surface as content marker so the round
+		// continues but consumers see the failure mode. Latency is
+		// the real measured time even on error (informative for
+		// timeout/network analysis).
+		return fmt.Sprintf("[invoker-error agent=%s round=%d] %v", agent.ID, round+1, err), latency
+	}
+	return resp, latency
+}
+
+// buildAgentPrompt composes the prompt sent to a ProviderInvoker.
+// Format: role-framing line + topic + round number. Callers wanting
+// richer prompts (CoT, few-shot, prior-round context) should wrap
+// their invoker rather than override this — keeps the orchestrator
+// minimal.
+func buildAgentPrompt(topic string, agent *Agent, round int) string {
+	role := agent.Role
+	if role == "" {
+		role = "debate participant"
+	}
+	return fmt.Sprintf(
+		"You are %s (provider=%s model=%s).\nDebate topic: %q\nRound %d: provide your position concisely (1-3 sentences).",
+		role, agent.Provider, agent.Model, topic, round+1,
+	)
 }
 
 // synthesiseContent produces deterministic stub content derived from
