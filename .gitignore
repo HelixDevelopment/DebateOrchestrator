@@ -1,33 +1,63 @@
+# DebateOrchestrator — .gitignore (round-272 CONST-053 hardened)
+
 # Build artefacts
 /bin/
 /build/
 /dist/
 /out/
+target/
 *.exe
 *.dll
 *.so
 *.dylib
 *.a
 *.o
+*.class
+*.pyc
 *.test
 
-# Cache
+# Cache files
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+.next/
 .cache/
+.gradle/
+.terraform/
 
-# Temp
+# Temp files
 *.tmp
 *.swp
 *~
 .DS_Store
 Thumbs.db
+*.orig
+*.rej
 
-# Coverage / reports
+# Sensitive-data files (CONST-042 + CONST-053)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+id_rsa*
+id_ed25519*
+.netrc
+secrets/
+api_keys.sh
+
+# Generated reports / logs
 *.log
 coverage.out
 coverage.html
+htmlcov/
 
-# Editor state
+# OS / IDE personal state
 .idea/
+.history/
 .vscode/
 
 # Go

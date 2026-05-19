@@ -1,0 +1,45 @@
+{
+  "_comment": "Round-272 bilingual fixture for digital.vasic.debate. Five locales — en, sr (Cyrillic), ja (Japanese), ar (Arabic, RTL), zh-CN (Han). Each entry carries: a debate topic exercised end-to-end through Orchestrator.ConductDebate with a capturing ProviderInvoker; a lesson Content body that round-trips through LessonBank.Add → Get → Search; and an APIAdapter participant config name. ASCII identifiers (provider, model, agent-id markers) stay constant so the orchestrator's pool selection runs deterministically — the locale variance proves the surrounding non-ASCII topic + lesson bytes survive the dispatch + storage round-trip without mutation.",
+  "inputs": [
+    {
+      "locale": "en",
+      "topic": "Should specialty coffee roasters disclose green-bean origin lot numbers on retail bags?",
+      "lesson_content": "Disclosing lot numbers improves traceability but increases label real estate cost.",
+      "search_substring": "traceability",
+      "participant_name": "alice-en",
+      "expected_min_runes": 30
+    },
+    {
+      "locale": "sr",
+      "topic": "Да ли мали београдски печењари треба да деле број шарже зрна на паковањима?",
+      "lesson_content": "Дељење броја шарже подиже поверење купаца, али захтева додатан простор на етикети.",
+      "search_substring": "поверење",
+      "participant_name": "ana-sr",
+      "expected_min_runes": 30
+    },
+    {
+      "locale": "ja",
+      "topic": "東京のスペシャルティコーヒー焙煎業者は小売袋にロット番号を開示すべきか？",
+      "lesson_content": "ロット番号の開示はトレーサビリティを高めるが、ラベルの面積コストを増加させる。",
+      "search_substring": "トレーサビリティ",
+      "participant_name": "yuki-ja",
+      "expected_min_runes": 12
+    },
+    {
+      "locale": "ar",
+      "topic": "هل ينبغي لمحمصات القهوة المتخصصة الكشف عن أرقام دفعات الحبوب الخضراء على أكياس البيع؟",
+      "lesson_content": "الكشف عن أرقام الدفعات يحسن إمكانية التتبع لكنه يزيد من تكلفة مساحة الملصق.",
+      "search_substring": "التتبع",
+      "participant_name": "layla-ar",
+      "expected_min_runes": 25
+    },
+    {
+      "locale": "zh-CN",
+      "topic": "上海的精品咖啡烘焙商是否应该在零售袋上披露生豆批次号？",
+      "lesson_content": "披露批次号能提高可追溯性，但会增加标签的面积成本。",
+      "search_substring": "可追溯性",
+      "participant_name": "li-zh",
+      "expected_min_runes": 10
+    }
+  ]
+}
