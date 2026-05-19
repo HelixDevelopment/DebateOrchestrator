@@ -85,9 +85,12 @@ func main() { _ = Foo() }
 	if sem.Passed {
 		t.Fatalf("semantic pass should have failed in strict mode; Issues=%v", sem.Issues)
 	}
+	// CONST-046: Issues are routed through the i18n seam. With the
+	// default NoopTranslator the entry is the stable message ID, so the
+	// assertion targets the ID rather than transient English text.
 	foundTodo := false
 	for _, iss := range sem.Issues {
-		if strings.Contains(iss, "TODO") {
+		if strings.Contains(iss, "todo_marker") || strings.Contains(iss, "TODO") {
 			foundTodo = true
 			break
 		}

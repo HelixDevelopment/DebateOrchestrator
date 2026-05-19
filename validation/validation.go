@@ -210,59 +210,59 @@ func structuralPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResul
 		if a.Content == "" {
 			pr.Passed = false
 			pr.Score = 0
-			pr.Issues = append(pr.Issues, "code artefact has empty content")
+			pr.Issues = append(pr.Issues, tr(msgCodeEmptyContent, nil))
 			return pr
 		}
 		curly, square, paren := countDelimiters(a.Content)
 		if curly != 0 {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, fmt.Sprintf("mismatched curly braces: delta=%d", curly))
+			pr.Issues = append(pr.Issues, tr(msgMismatchedCurly, map[string]any{"Delta": curly}))
 		}
 		if square != 0 {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, fmt.Sprintf("mismatched square brackets: delta=%d", square))
+			pr.Issues = append(pr.Issues, tr(msgMismatchedSquare, map[string]any{"Delta": square}))
 		}
 		if paren != 0 {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, fmt.Sprintf("mismatched parentheses: delta=%d", paren))
+			pr.Issues = append(pr.Issues, tr(msgMismatchedParen, map[string]any{"Delta": paren}))
 		}
 	case ArtifactConfig:
 		if a.Content == "" {
 			pr.Passed = false
 			pr.Score = 0
-			pr.Issues = append(pr.Issues, "config artefact has empty content")
+			pr.Issues = append(pr.Issues, tr(msgConfigEmptyContent, nil))
 			return pr
 		}
 		if !looksLikeJSON(a.Content) && !looksLikeYAML(a.Content) {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, "config does not parse as JSON or simple YAML")
+			pr.Issues = append(pr.Issues, tr(msgConfigNotParseable, nil))
 		}
 	case ArtifactDocumentation:
 		if strings.TrimSpace(a.Content) == "" {
 			pr.Passed = false
 			pr.Score = 0
-			pr.Issues = append(pr.Issues, "documentation artefact is empty")
+			pr.Issues = append(pr.Issues, tr(msgDocEmpty, nil))
 			return pr
 		}
 		if !hasMarkdownHeader(a.Content) {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, "documentation has no markdown header (line starting with '#')")
+			pr.Issues = append(pr.Issues, tr(msgDocNoHeader, nil))
 		}
 	case ArtifactPrompt:
 		trimmed := strings.TrimSpace(a.Content)
 		if trimmed == "" {
 			pr.Passed = false
 			pr.Score = 0
-			pr.Issues = append(pr.Issues, "prompt artefact is empty")
+			pr.Issues = append(pr.Issues, tr(msgPromptEmpty, nil))
 			return pr
 		}
 		if len(trimmed) < 10 {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, fmt.Sprintf("prompt too short: len=%d (min 10)", len(trimmed)))
+			pr.Issues = append(pr.Issues, tr(msgPromptTooShort, map[string]any{"Len": len(trimmed)}))
 		}
 	default:
 		pr.Passed = false
-		pr.Issues = append(pr.Issues, fmt.Sprintf("unknown artefact type: %q", a.Type))
+		pr.Issues = append(pr.Issues, tr(msgUnknownArtifactType, map[string]any{"Type": string(a.Type)}))
 	}
 	if !pr.Passed {
 		pr.Score = scoreFromIssues(len(pr.Issues))
@@ -441,13 +441,13 @@ func semanticPass(_ context.Context, a *Artifact, cfg PipelineConfig) *PassResul
 		if reTodoMarker.MatchString(a.Content) {
 			if cfg.Strict {
 				pr.Passed = false
-				pr.Issues = append(pr.Issues, "TODO/FIXME/XXX marker present (strict mode)")
+				pr.Issues = append(pr.Issues, tr(msgTodoMarkerStrict, nil))
 			} else {
-				pr.Issues = append(pr.Issues, "TODO/FIXME/XXX marker present (non-strict warning)")
+				pr.Issues = append(pr.Issues, tr(msgTodoMarkerWarning, nil))
 			}
 		}
 		if rePanicCall.MatchString(a.Content) && !strings.Contains(a.Content, "_test.go") {
-			pr.Issues = append(pr.Issues, "panic(...) call found in non-test code (concern)")
+			pr.Issues = append(pr.Issues, tr(msgPanicInNonTest, nil))
 		}
 	case ArtifactConfig:
 		if matches := reLeakLine.FindAllStringSubmatch(a.Content, -1); len(matches) > 0 {
@@ -457,23 +457,23 @@ func semanticPass(_ context.Context, a *Artifact, cfg PipelineConfig) *PassResul
 					continue
 				}
 				pr.Passed = false
-				pr.Issues = append(pr.Issues, fmt.Sprintf("possible secret leak: %s=%s", m[1], val))
+				pr.Issues = append(pr.Issues, tr(msgSecretLeak, map[string]any{"Key": m[1], "Value": val}))
 			}
 		}
 	case ArtifactDocumentation:
 		count := len(reUnclosedCodeBlock.FindAllStringIndex(a.Content, -1))
 		if count%2 != 0 {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, fmt.Sprintf("unclosed markdown code block: %d fence(s) found", count))
+			pr.Issues = append(pr.Issues, tr(msgUnclosedCodeBlock, map[string]any{"Count": count}))
 		}
 	case ArtifactPrompt:
 		if rePlaceholderMust.MatchString(a.Content) {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, "prompt contains unfilled {{var}} placeholder")
+			pr.Issues = append(pr.Issues, tr(msgPromptUnfilledMustache, nil))
 		}
 		if rePlaceholderAngle.MatchString(a.Content) {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, "prompt contains <TODO>/<PLACEHOLDER>/<FIXME> marker")
+			pr.Issues = append(pr.Issues, tr(msgPromptPlaceholderTag, nil))
 		}
 	}
 	if !pr.Passed {
@@ -534,7 +534,7 @@ func consistencyPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResu
 			ref := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
 			if !ref.MatchString(rest) {
 				pr.Passed = false
-				pr.Issues = append(pr.Issues, fmt.Sprintf("declared function %q has no references elsewhere in artefact", name))
+				pr.Issues = append(pr.Issues, tr(msgOrphanFunction, map[string]any{"Name": name}))
 			}
 		}
 	}
@@ -545,11 +545,11 @@ func consistencyPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResu
 			case string:
 				if strings.TrimSpace(v) == "" {
 					pr.Passed = false
-					pr.Issues = append(pr.Issues, "metadata.version is empty string")
+					pr.Issues = append(pr.Issues, tr(msgMetadataVersionEmpty, nil))
 				}
 			default:
 				pr.Passed = false
-				pr.Issues = append(pr.Issues, fmt.Sprintf("metadata.version must be a non-empty string, got %T", raw))
+				pr.Issues = append(pr.Issues, tr(msgMetadataVersionType, map[string]any{"GotType": fmt.Sprintf("%T", raw)}))
 			}
 		}
 	}
@@ -577,14 +577,14 @@ func qualityPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResult {
 		for i, ln := range lines {
 			if len(ln) > maxLineLength {
 				longCount++
-				pr.Issues = append(pr.Issues, fmt.Sprintf("line %d exceeds %d chars (%d)", i+1, maxLineLength, len(ln)))
+				pr.Issues = append(pr.Issues, tr(msgLineTooLong, map[string]any{"Line": i + 1, "Max": maxLineLength, "Len": len(ln)}))
 			}
 			if len(ln) > 0 && (ln[len(ln)-1] == ' ' || ln[len(ln)-1] == '\t') {
 				trailingWS++
 			}
 		}
 		if trailingWS > 0 {
-			pr.Issues = append(pr.Issues, fmt.Sprintf("%d line(s) with trailing whitespace", trailingWS))
+			pr.Issues = append(pr.Issues, tr(msgTrailingWhitespace, map[string]any{"Count": trailingWS}))
 		}
 		// Score: start at 1.0, subtract for each issue category.
 		score := 1.0
@@ -607,7 +607,7 @@ func qualityPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResult {
 		words := len(strings.Fields(a.Content))
 		if words <= 5 {
 			pr.Passed = false
-			pr.Issues = append(pr.Issues, fmt.Sprintf("documentation too short: %d word(s) (min 6)", words))
+			pr.Issues = append(pr.Issues, tr(msgDocTooShort, map[string]any{"Words": words}))
 			pr.Score = scoreFromIssues(1)
 		}
 	case ArtifactConfig:
@@ -616,7 +616,7 @@ func qualityPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResult {
 		for i, ln := range lines {
 			if len(ln) > maxLineLength {
 				long++
-				pr.Issues = append(pr.Issues, fmt.Sprintf("line %d exceeds %d chars (%d)", i+1, maxLineLength, len(ln)))
+				pr.Issues = append(pr.Issues, tr(msgLineTooLong, map[string]any{"Line": i + 1, "Max": maxLineLength, "Len": len(ln)}))
 			}
 		}
 		if long > 0 {
@@ -628,10 +628,10 @@ func qualityPass(_ context.Context, a *Artifact, _ PipelineConfig) *PassResult {
 		l := len(strings.TrimSpace(a.Content))
 		switch {
 		case l < 20:
-			pr.Issues = append(pr.Issues, fmt.Sprintf("prompt very short: %d chars", l))
+			pr.Issues = append(pr.Issues, tr(msgPromptVeryShort, map[string]any{"Chars": l}))
 			pr.Score = 0.5
 		case l > 4000:
-			pr.Issues = append(pr.Issues, fmt.Sprintf("prompt very long: %d chars", l))
+			pr.Issues = append(pr.Issues, tr(msgPromptVeryLong, map[string]any{"Chars": l}))
 			pr.Score = 0.7
 		default:
 			pr.Score = 1.0

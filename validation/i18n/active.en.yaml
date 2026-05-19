@@ -1,0 +1,39 @@
+# active.en.yaml — English source bundle for package validation's
+# CONST-046-migrated operator-facing diagnostic strings (round-334).
+#
+# CONST-051(B) decoupling: this bundle ships WITH the submodule so the
+# package is standalone-usable; a consuming project (HelixCode,
+# HelixAgent, ATMOSphere) loads it with go-i18n, wraps it in a thin
+# Translator adapter, and installs it via validation.SetTranslator at
+# boot. Locale overrides (active.sr.yaml, active.ja.yaml, ...) live
+# alongside this file in the consuming project's bundle tree.
+#
+# Placeholders use go-i18n's {{.Name}} template syntax; the keys match
+# the templateData maps passed to tr() in validation.go.
+
+validation.issue.code_empty_content: "code artefact has empty content"
+validation.issue.mismatched_curly: "mismatched curly braces: delta={{.Delta}}"
+validation.issue.mismatched_square: "mismatched square brackets: delta={{.Delta}}"
+validation.issue.mismatched_paren: "mismatched parentheses: delta={{.Delta}}"
+validation.issue.config_empty_content: "config artefact has empty content"
+validation.issue.config_not_parseable: "config does not parse as JSON or simple YAML"
+validation.issue.doc_empty: "documentation artefact is empty"
+validation.issue.doc_no_header: "documentation has no markdown header (line starting with '#')"
+validation.issue.prompt_empty: "prompt artefact is empty"
+validation.issue.prompt_too_short: "prompt too short: len={{.Len}} (min 10)"
+validation.issue.unknown_artifact_type: "unknown artefact type: {{.Type}}"
+validation.issue.todo_marker_strict: "TODO/FIXME/XXX marker present (strict mode)"
+validation.issue.todo_marker_warning: "TODO/FIXME/XXX marker present (non-strict warning)"
+validation.issue.panic_in_non_test: "panic(...) call found in non-test code (concern)"
+validation.issue.secret_leak: "possible secret leak: {{.Key}}={{.Value}}"
+validation.issue.unclosed_code_block: "unclosed markdown code block: {{.Count}} fence(s) found"
+validation.issue.prompt_unfilled_mustache: "prompt contains unfilled {{var}} placeholder"
+validation.issue.prompt_placeholder_tag: "prompt contains <TODO>/<PLACEHOLDER>/<FIXME> marker"
+validation.issue.orphan_function: "declared function {{.Name}} has no references elsewhere in artefact"
+validation.issue.metadata_version_empty: "metadata.version is empty string"
+validation.issue.metadata_version_type: "metadata.version must be a non-empty string, got {{.GotType}}"
+validation.issue.line_too_long: "line {{.Line}} exceeds {{.Max}} chars ({{.Len}})"
+validation.issue.trailing_whitespace: "{{.Count}} line(s) with trailing whitespace"
+validation.issue.doc_too_short: "documentation too short: {{.Words}} word(s) (min 6)"
+validation.issue.prompt_very_short: "prompt very short: {{.Chars}} chars"
+validation.issue.prompt_very_long: "prompt very long: {{.Chars}} chars"
