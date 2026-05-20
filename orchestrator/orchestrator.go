@@ -314,19 +314,23 @@ func (o *Orchestrator) ConductDebate(ctx context.Context, req *DebateRequest) (*
 		avgConfidence = totalConfidence / float64(calls)
 	}
 
-	conclusion := fmt.Sprintf("Debate on %q completed across %d round(s).",
-		resolved.Topic, resolved.MaxRounds)
+	conclusion := tr(msgConsensusConclusion, map[string]any{
+		"Topic":  resolved.Topic,
+		"Rounds": resolved.MaxRounds,
+	})
 	consensus := &ConsensusResponse{
 		Achieved:   avgConfidence >= resolved.MinConsensus,
 		Confidence: avgConfidence,
 		Conclusion: conclusion,
-		Reasoning: fmt.Sprintf("Aggregate confidence %.3f over %d agent invocations.",
-			avgConfidence, calls),
+		Reasoning: tr(msgConsensusReasoning, map[string]any{
+			"Confidence": fmt.Sprintf("%.3f", avgConfidence),
+			"Calls":      calls,
+		}),
 		Summary: conclusion,
 		KeyPoints: []string{
-			fmt.Sprintf("Topic: %s", resolved.Topic),
-			fmt.Sprintf("Rounds: %d", resolved.MaxRounds),
-			fmt.Sprintf("Participants: %d", len(participants)),
+			tr(msgConsensusKeyTopic, map[string]any{"Topic": resolved.Topic}),
+			tr(msgConsensusKeyRounds, map[string]any{"Rounds": resolved.MaxRounds}),
+			tr(msgConsensusKeyParticip, map[string]any{"Participants": len(participants)}),
 		},
 		Dissents: []string{},
 	}

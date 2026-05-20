@@ -1,0 +1,19 @@
+# active.en.yaml — English source bundle for package orchestrator's
+# CONST-046-migrated operator-facing ConsensusResponse strings
+# (round-395, 2026-05-19/20).
+#
+# CONST-051(B) decoupling: this bundle ships WITH the submodule so the
+# package is standalone-usable; a consuming project (HelixCode,
+# HelixAgent, ATMOSphere) loads it with go-i18n, wraps it in a thin
+# Translator adapter, and installs it via orchestrator.SetTranslator at
+# boot. Locale overrides (active.sr.yaml, active.ja.yaml, ...) live
+# alongside this file in the consuming project's bundle tree.
+#
+# Placeholders use go-i18n's {{.Name}} template syntax; the keys match
+# the templateData maps passed to tr() in orchestrator.go.
+
+debate.orchestrator.consensus_conclusion: "Debate on {{.Topic}} completed across {{.Rounds}} round(s)."
+debate.orchestrator.consensus_reasoning: "Aggregate confidence {{.Confidence}} over {{.Calls}} agent invocations."
+debate.orchestrator.consensus_key_topic: "Topic: {{.Topic}}"
+debate.orchestrator.consensus_key_rounds: "Rounds: {{.Rounds}}"
+debate.orchestrator.consensus_key_participants: "Participants: {{.Participants}}"

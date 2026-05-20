@@ -120,7 +120,7 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 		_ = handler(&StreamEvent{
 			Type:      "cancelled",
 			DebateID:  req.ID,
-			Content:   fmt.Sprintf("context cancelled before debate start: %v", err),
+			Content:   tr(msgCtxCancelledBeforeStart, map[string]any{"Err": err}),
 			Timestamp: time.Now().UTC(),
 			Progress:  0.0,
 		})
@@ -131,7 +131,7 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 	startEvt := &StreamEvent{
 		Type:      "started",
 		DebateID:  req.ID,
-		Content:   fmt.Sprintf("debate started: topic=%q", req.Topic),
+		Content:   tr(msgDebateStarted, map[string]any{"Topic": req.Topic}),
 		Timestamp: time.Now().UTC(),
 		Progress:  0.0,
 	}
@@ -146,13 +146,15 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 		// surface the orchestrator failure as an event AND as the
 		// returned error.
 		evtType := "failed"
+		contentMsgID := msgDebateFailed
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			evtType = "cancelled"
+			contentMsgID = msgDebateCancelled
 		}
 		_ = handler(&StreamEvent{
 			Type:      evtType,
 			DebateID:  req.ID,
-			Content:   fmt.Sprintf("debate %s: %v", evtType, err),
+			Content:   tr(contentMsgID, map[string]any{"Err": err}),
 			Timestamp: time.Now().UTC(),
 			Progress:  0.0,
 		})
@@ -172,7 +174,7 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 			_ = handler(&StreamEvent{
 				Type:      "cancelled",
 				DebateID:  debateID,
-				Content:   fmt.Sprintf("context cancelled mid-stream: %v", ctxErr),
+				Content:   tr(msgCtxCancelledMidStream, map[string]any{"Err": ctxErr}),
 				Timestamp: time.Now().UTC(),
 				Progress:  phaseProgress(i, phaseCount, 0, 0),
 			})
@@ -183,10 +185,14 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 		endProg := phaseProgress(i, phaseCount, 1, 1)
 
 		phaseStartEvt := &StreamEvent{
-			Type:      "phase_started",
-			Phase:     phase.Name,
-			DebateID:  debateID,
-			Content:   fmt.Sprintf("phase started: %s (round %d, %d responses)", phase.Name, phase.Round, len(phase.Responses)),
+			Type:     "phase_started",
+			Phase:    phase.Name,
+			DebateID: debateID,
+			Content: tr(msgPhaseStarted, map[string]any{
+				"Phase":     phase.Name,
+				"Round":     phase.Round,
+				"Responses": len(phase.Responses),
+			}),
 			Timestamp: time.Now().UTC(),
 			Progress:  startProg,
 		}
@@ -205,7 +211,7 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 					Phase:     phase.Name,
 					AgentID:   ar.AgentID,
 					DebateID:  debateID,
-					Content:   fmt.Sprintf("context cancelled mid-phase: %v", ctxErr),
+					Content:   tr(msgCtxCancelledMidPhase, map[string]any{"Err": ctxErr}),
 					Timestamp: time.Now().UTC(),
 					Progress:  phaseProgress(i, phaseCount, j, respCount),
 				})
@@ -234,10 +240,13 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 		}
 
 		phaseEndEvt := &StreamEvent{
-			Type:      "phase_completed",
-			Phase:     phase.Name,
-			DebateID:  debateID,
-			Content:   fmt.Sprintf("phase completed: %s (duration=%s)", phase.Name, phase.Duration),
+			Type:     "phase_completed",
+			Phase:    phase.Name,
+			DebateID: debateID,
+			Content: tr(msgPhaseCompleted, map[string]any{
+				"Phase":    phase.Name,
+				"Duration": phase.Duration,
+			}),
 			Timestamp: time.Now().UTC(),
 			Progress:  endProg,
 		}
@@ -247,8 +256,11 @@ func (m *IntegrationManager) StreamDebate(ctx context.Context, req *DebateReques
 	}
 
 	// 4) "completed" event — final, Progress=1.0, real summary.
-	completedContent := fmt.Sprintf("debate completed: rounds=%d participants=%d success=%t",
-		resp.RoundsConducted, len(resp.Participants), resp.Success)
+	completedContent := tr(msgDebateCompleted, map[string]any{
+		"Rounds":       resp.RoundsConducted,
+		"Participants": len(resp.Participants),
+		"Success":      resp.Success,
+	})
 	completedEvt := &StreamEvent{
 		Type:      "completed",
 		DebateID:  debateID,

@@ -1,0 +1,23 @@
+# active.en.yaml — English source bundle for package comprehensive's
+# CONST-046-migrated operator-facing StreamEvent.Content strings
+# (round-395, 2026-05-19/20).
+#
+# CONST-051(B) decoupling: this bundle ships WITH the submodule so the
+# package is standalone-usable; a consuming project (HelixCode,
+# HelixAgent, ATMOSphere) loads it with go-i18n, wraps it in a thin
+# Translator adapter, and installs it via comprehensive.SetTranslator
+# at boot. Locale overrides (active.sr.yaml, active.ja.yaml, ...) live
+# alongside this file in the consuming project's bundle tree.
+#
+# Placeholders use go-i18n's {{.Name}} template syntax; the keys match
+# the templateData maps passed to tr() in manager.go.
+
+debate.comprehensive.ctx_cancelled_before_start: "context cancelled before debate start: {{.Err}}"
+debate.comprehensive.debate_started: "debate started: topic={{.Topic}}"
+debate.comprehensive.debate_failed: "debate failed: {{.Err}}"
+debate.comprehensive.debate_cancelled: "debate cancelled: {{.Err}}"
+debate.comprehensive.ctx_cancelled_mid_stream: "context cancelled mid-stream: {{.Err}}"
+debate.comprehensive.phase_started: "phase started: {{.Phase}} (round {{.Round}}, {{.Responses}} responses)"
+debate.comprehensive.ctx_cancelled_mid_phase: "context cancelled mid-phase: {{.Err}}"
+debate.comprehensive.phase_completed: "phase completed: {{.Phase}} (duration={{.Duration}})"
+debate.comprehensive.debate_completed: "debate completed: rounds={{.Rounds}} participants={{.Participants}} success={{.Success}}"
