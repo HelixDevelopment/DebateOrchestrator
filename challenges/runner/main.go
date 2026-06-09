@@ -521,11 +521,13 @@ func section4APIAdapter(fx fixtureFile) {
 			continue
 		}
 		if resp == nil || resp.Topic != in.Topic {
+			cancel()
 			fail("[Section4][CreateDebate][%s] topic mismatch or nil resp", in.Locale)
 			continue
 		}
 		// Strategy=mesh must surface in resp.Metadata
 		if strat, ok := resp.Metadata["strategy"]; !ok || strat != "mesh" {
+			cancel()
 			fail("[Section4][CreateDebate][%s] metadata.strategy missing or wrong: %v",
 				in.Locale, resp.Metadata["strategy"])
 			continue
@@ -543,11 +545,13 @@ func section4APIAdapter(fx fixtureFile) {
 			}
 		}
 		if !foundOpenAI {
+			cancel()
 			fail("[Section4][EffectiveProvider][%s] openai/gpt-test (LLMProvider alias) not registered",
 				in.Locale)
 			continue
 		}
 		if !foundOllama {
+			cancel()
 			fail("[Section4][EffectiveProvider][%s] ollama/llama-test (Provider field) not registered",
 				in.Locale)
 			continue
