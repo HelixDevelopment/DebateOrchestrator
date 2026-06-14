@@ -52,10 +52,27 @@ func (NoopTranslator) T(_ context.Context, id string, _ map[string]any) (string,
 	return id, nil
 }
 
+// defaultTranslator is the process-wide translator installed when no
+// consumer has wired one (and the value SetTranslator(nil) /
+// ResetTranslatorToDefault reset to). It is replaced by the fix below
+// with a real bundle-backed translator so the package renders prose
+// out-of-the-box; until then it echoes keys verbatim (the HXC-079
+// defect).
+var defaultTranslator Translator = NoopTranslator{}
+
 var (
 	translatorMu sync.RWMutex
-	translator   Translator = NoopTranslator{}
+	translator   Translator = defaultTranslator
 )
+
+// ResetTranslatorToDefault restores the package-default translator —
+// equivalent to a fresh process before any SetTranslator call. Safe for
+// concurrent use.
+func ResetTranslatorToDefault() {
+	translatorMu.Lock()
+	defer translatorMu.Unlock()
+	translator = defaultTranslator
+}
 
 // SetTranslator installs the process-wide Translator the orchestrator
 // package uses for operator-facing ConsensusResponse strings. Passing
@@ -66,7 +83,7 @@ func SetTranslator(t Translator) {
 	translatorMu.Lock()
 	defer translatorMu.Unlock()
 	if t == nil {
-		translator = NoopTranslator{}
+		translator = defaultTranslator
 		return
 	}
 	translator = t

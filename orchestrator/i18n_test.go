@@ -39,7 +39,12 @@ func (erroringTranslator) T(_ context.Context, _ string, _ map[string]any) (stri
 }
 
 func TestI18n_NoopTranslatorEchoesID(t *testing.T) {
-	SetTranslator(nil)
+	// Reconciled per §11.4.120 (HXC-079): the package DEFAULT translator
+	// is now the bundle-backed translator (renders prose out of the box),
+	// so SetTranslator(nil) no longer echoes the raw key. NoopTranslator's
+	// echo contract is unchanged — assert it by installing NoopTranslator
+	// explicitly rather than via the package default.
+	SetTranslator(NoopTranslator{})
 	defer SetTranslator(nil)
 	got := tr(msgConsensusConclusion, map[string]any{"Topic": "x", "Rounds": 1})
 	if got != msgConsensusConclusion {
