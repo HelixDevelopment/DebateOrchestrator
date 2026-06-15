@@ -39,7 +39,15 @@ func DefaultOrchestratorConfig() OrchestratorConfig {
 		EnableCrossDebateLearning: true,
 		MinAgentsPerDebate:        2,
 		DefaultMaxRounds:          3,
-		DefaultTimeout:            30 * time.Second,
+		// DefaultTimeout must accommodate DefaultMaxRounds (3) of real
+		// multi-agent LLM debate. The previous 30s only fit a fast/weak
+		// stub model; a capable model takes ~16s/round/agent, so a
+		// 3-round × 2-agent debate (≈96s) plus synthesis/consensus
+		// overhead and network jitter blows 30s with
+		// "context deadline exceeded". 180s = ≈2× the 96s worst case,
+		// giving headroom. Callers needing a different cap override via
+		// the request (DebateRequest.Timeout) or WithTimeout option.
+		DefaultTimeout:            180 * time.Second,
 		DefaultTopology:           topology.GraphMesh,
 	}
 }

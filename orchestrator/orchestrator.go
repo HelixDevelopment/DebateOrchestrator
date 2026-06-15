@@ -57,6 +57,22 @@ func WithProviderInvoker(invoker ProviderInvoker) Option {
 	}
 }
 
+// WithTimeout overrides the orchestrator's per-debate default wall-clock
+// timeout (cfg.DefaultTimeout) for debates whose request omits a Timeout.
+// A non-positive duration is ignored (the existing default is kept), so
+// callers cannot accidentally disable the cap. Per-debate overrides via
+// DebateRequest.Timeout still take precedence over this orchestrator-level
+// default (see resolveRequest). This mirrors WithProviderInvoker so
+// consumers can configure the cap explicitly when a slow/capable provider
+// needs more than the conservative default.
+func WithTimeout(d time.Duration) Option {
+	return func(o *Orchestrator) {
+		if d > 0 {
+			o.cfg.DefaultTimeout = d
+		}
+	}
+}
+
 // NewOrchestrator constructs an Orchestrator. registry may be nil; in
 // that case provider registration succeeds locally but cannot resolve
 // LLMs. bank may be nil; in that case learning persistence is disabled.
