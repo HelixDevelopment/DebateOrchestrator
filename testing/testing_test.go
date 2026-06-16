@@ -453,7 +453,7 @@ func TestSandboxExecute_TimeoutEnforced(t *stdtesting.T) {
 func TestSandboxExecute_MemoryLimitLinuxOnly(t *stdtesting.T) {
 	if runtime.GOOS != "linux" {
 		// SKIP-OK: #non-linux-host
-		t.Skip("requires linux for RLIMIT_AS enforcement")
+		t.Skip("SKIP-OK: requires linux for RLIMIT_AS enforcement")
 	}
 	// Cap at 32 MiB. Allocate 512 MiB → must be killed.
 	e := NewSandboxedTestExecutor(
